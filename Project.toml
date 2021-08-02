@@ -1,0 +1,8 @@
+name = "Cronenberg"
+uuid = "bb11576f-1c9b-4e86-a2d3-0fed364f8d41"
+authors = ["Daniel C. Jones <dcjones@cs.washington.edu>"]
+version = "0.1.0"
+
+[deps]
+Blink = "ad839575-38b3-5650-b840-f874b8c74a25"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
