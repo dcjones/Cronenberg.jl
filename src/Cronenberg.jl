@@ -9,15 +9,25 @@ using StaticArrays
 const Tile = Tuple{UnitRange{Int}, UnitRange{Int}}
 
 # Constant encoding neighbor positions
+
+# With diagonals
+# const NEIGHBORS = SA[
+#     (-1,  0),
+#     (-1,  1),
+#     ( 0,  1),
+#     ( 1,  1),
+#     ( 1,  0),
+#     ( 1, -1),
+#     ( 0, -1),
+#     (-1, -1) ]
+
+
+# Without diagonals
 const NEIGHBORS = SA[
     (-1,  0),
-    (-1,  1),
     ( 0,  1),
-    ( 1,  1),
     ( 1,  0),
-    ( 1, -1),
-    ( 0, -1),
-    (-1, -1) ]
+    ( 0, -1) ]
 
 
 """
@@ -225,8 +235,8 @@ end
 
 
 function random_neighbor(neighbors::UInt8)
-    nth_zero = rand(1:count_zeros(neighbors))
-    for i in 1:8
+    nth_zero = rand(1:(length(NEIGHBORS) - count_ones(neighbors)))
+    for i in 1:length(NEIGHBORS)
         if (neighbors >> (i-1)) & 0x1 == 0
             nth_zero -= 1
             if nth_zero == 0
@@ -255,15 +265,15 @@ function Δsource_area(world::World, i_source::Int, j_source::Int, i_dest::Int, 
         if 1 <= i <= m && 1 <= j <= n
             if world.state[i, j] == source_state
                 neighbor_count += 1
-                if count_zeros(world.neighbors[i, j]) == 1
+                if (length(NEIGHBORS) - count_ones(world.neighbors[i, j])) == 1
                     Δ -= 1
                 end
             end
         end
     end
 
-    # Add one for the new pixel, if it's not surrounding.
-    if neighbor_count != 8
+    # Add one for the new pixel, if it's not surrounded.
+    if neighbor_count != length(NEIGHBORS)
         Δ += 1
     end
 
@@ -285,7 +295,7 @@ function Δdest_area(world::World, i_source::Int, j_source::Int, i_dest::Int, j_
         if 1 <= i <= m && 1 <= j <= n
             if world.state[i, j] == dest_state
                 neighbor_count += 1
-                if count_ones(world.neighbors[i, j]) == 8
+                if count_ones(world.neighbors[i, j]) == length(NEIGHBORS)
                     Δ += 1
                 end
             end
@@ -293,7 +303,7 @@ function Δdest_area(world::World, i_source::Int, j_source::Int, i_dest::Int, j_
     end
 
     # Lose one area if (i_dest, j_dest) was not surrounded
-    if neighbor_count != 8
+    if neighbor_count != length(NEIGHBORS)
         Δ -= 1
     end
 
@@ -381,7 +391,7 @@ function tick(world::World, rules::RuleSet, E::Float32)
             # sampling)
             i_source, j_source = rand(yrange), rand(xrange)
             attempts = 1000
-            while count_zeros(world.neighbors[i_source, j_source]) == 0 && attempts > 0
+            while (length(NEIGHBORS) - count_ones(world.neighbors[i_source, j_source])) == 0 && attempts > 0
                 i_source, j_source = rand(yrange), rand(xrange)
                 attempts -= 1
             end
@@ -465,7 +475,7 @@ function check_area_volume(world::World)
         if s != 0
             volumes[s] += 1
             @assert neighbors == check_neighbors(world.state, i, j)
-            if count_zeros(neighbors) > 0
+            if (length(NEIGHBORS) - count_ones(neighbors)) > 0
                 areas[s] += 1
             end
         end
@@ -563,10 +573,11 @@ function run(world::World, rules::RuleSet; nsteps::Int=1000, pixelsize::Int=5)
     for step in 1:nsteps
         copy!(prevstate, world.state)
         E = tick(world, rules, E)
-        @show (world.volumes[1], world.areas[1])
-        @show (E, loss(world, rules))
+        # @show (world.volumes[1], world.areas[1])
+        # @show (E, loss(world, rules))
         redraw_world(blink_window[], world, prevstate, colors, rules.ntypes)
-        sleep(0.05)
+        # sleep(0.05)
+        @show E
     end
 
     while true
