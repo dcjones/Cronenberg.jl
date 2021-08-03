@@ -11,23 +11,23 @@ const Tile = Tuple{UnitRange{Int}, UnitRange{Int}}
 # Constant encoding neighbor positions
 
 # With diagonals
-# const NEIGHBORS = SA[
-#     (-1,  0),
-#     (-1,  1),
-#     ( 0,  1),
-#     ( 1,  1),
-#     ( 1,  0),
-#     ( 1, -1),
-#     ( 0, -1),
-#     (-1, -1) ]
+const NEIGHBORS = SA[
+    (-1,  0),
+    (-1,  1),
+    ( 0,  1),
+    ( 1,  1),
+    ( 1,  0),
+    ( 1, -1),
+    ( 0, -1),
+    (-1, -1) ]
 
 
 # Without diagonals
-const NEIGHBORS = SA[
-    (-1,  0),
-    ( 0,  1),
-    ( 1,  0),
-    ( 0, -1) ]
+# const NEIGHBORS = SA[
+#     (-1,  0),
+#     ( 0,  1),
+#     ( 1,  0),
+#     ( 0, -1) ]
 
 
 """
@@ -89,13 +89,41 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
     coords = [(i,j) for i in 1:m, j in 1:n]
     shuffle!(coords)
 
-    for k in 1:ncells
-        i, j = coords[k]
-        state[i, j] = k
-        types[k] = rand(1:ncelltype)
-        volumes[k] = 1
-        areas[k] = 1
+    # for k in 1:ncells
+    #     i, j = coords[k]
+    #     state[i, j] = k
+    #     types[k] = rand(1:ncelltype)
+    #     volumes[k] = 1
+    #     areas[k] = 1
+    # end
+
+    # Clumpier initialization: choose random rectangles, choose a random
+    # cell type, put some cells in there
+    ncells_remaining = ncells
+    max_cells_per_rect = 200
+    while ncells_remaining > 0
+        h = rand(1:m)
+        w = rand(1:n)
+        i0 = rand(1:(m - h + 1))
+        j0 = rand(1:(n - w + 1))
+        i1 = i0 + h - 1
+        j1 = j0 + w - 1
+
+        type = rand(1:ncelltype)
+        nrectcells = min(ncells_remaining, rand(1:max_cells_per_rect))
+        @show nrectcells
+
+        for i in 1:nrectcells
+            i = rand(i0:i1)
+            j = rand(j0:j1)
+            state[i, j] = ncells_remaining
+            types[ncells_remaining] = type
+            volumes[ncells_remaining] = 1
+            areas[ncells_remaining] = 1
+            ncells_remaining -= 1
+        end
     end
+
 
     # Build neighbors matrix
     neighbors = check_neighbors(state)
@@ -107,6 +135,8 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
     nytiles = max(1, div(m, nominal_tile_size, RoundUp))
     nxtiles = max(1, div(n, nominal_tile_size, RoundUp))
     ntiles = nxtiles * nytiles
+
+    @show ntiles
 
     for quadrant in 1:4
         tiles[quadrant] = Vector{Tile}(undef, ntiles)
@@ -228,7 +258,7 @@ function loss(world::World, rules::RuleSet)
     # everything gets counted in both directions in the above. Correct for this.
     E_adhesion /= 2
 
-    @show (E_area, E_vol, E_adhesion)
+    # @show (E_area, E_vol, E_adhesion)
 
     return E_area + E_vol + E_adhesion
 end
@@ -338,7 +368,6 @@ function Δloss(
         ΔE_area += rules.elasticity_area[source_type] * (
             (rules.target_area[source_type] - new_area)^2 -
             (rules.target_area[source_type] - world.areas[source_state])^2)
-
     end
 
     if dest_type != 0
@@ -351,7 +380,15 @@ function Δloss(
             (rules.target_area[dest_type] - new_area)^2 -
             (rules.target_area[dest_type] - world.areas[dest_state])^2)
 
+        # Don't let any cells disappear entirely
+        if world.volumes[dest_state] == 1
+            ΔE_vol = Inf32
+        end
 
+        # TODO: Cells need to remain connected components. Check if this move
+        # would disconnect the cell, and if so set ΔE to Inf32.
+        #
+        # How to we affordably check this?
     end
 
     # recompute adhesion scores in light of (i_dest, j_dest) being set to type `source_state`
@@ -396,6 +433,8 @@ function tick(world::World, rules::RuleSet, E::Float32)
                 attempts -= 1
             end
 
+            # @show (k, i_source, j_source, getstate(world, i_source, j_source), count_ones(world.neighbors[i_source, j_source]))
+
             if attempts == 0
                 continue
             end
@@ -417,8 +456,12 @@ function tick(world::World, rules::RuleSet, E::Float32)
             # Evaluate the energy of copying our state to the neighbors state
             ΔE = Δloss(world, rules, i_source, j_source, i_dest, j_dest)
 
+            # @show (gettype(world, i_source, j_source), gettype(world, i_dest, j_dest))
+            # @show ΔE
+
             # accept?
-            if ΔE < 0 || rand() < exp(-ΔE)
+            T = 1.0
+            if ΔE < 0 || rand() < exp(-ΔE/T)
                 source_state = getstate(world, i_source, j_source)
                 dest_state = getstate(world, i_dest, j_dest)
 
@@ -537,7 +580,7 @@ function redraw_world(win::Blink.Window, world::World, prevstate::Matrix{Int32},
 end
 
 
-function run(world::World, rules::RuleSet; nsteps::Int=1000, pixelsize::Int=5)
+function run(world::World, rules::RuleSet; nsteps::Int=10000, pixelsize::Int=3)
     m, n = size(world)
 
     if blink_window[] === nothing || !Blink.active(blink_window[])
@@ -570,14 +613,19 @@ function run(world::World, rules::RuleSet; nsteps::Int=1000, pixelsize::Int=5)
 
     E = loss(world, rules)
     prevstate = similar(world.state)
+    copy!(prevstate, world.state)
+
     for step in 1:nsteps
-        copy!(prevstate, world.state)
         E = tick(world, rules, E)
         # @show (world.volumes[1], world.areas[1])
+        # @show (maximum(world.volumes), maximum(world.areas))
         # @show (E, loss(world, rules))
-        redraw_world(blink_window[], world, prevstate, colors, rules.ntypes)
         # sleep(0.05)
-        @show E
+        if step % 1000 == 0
+            redraw_world(blink_window[], world, prevstate, colors, rules.ntypes)
+            copy!(prevstate, world.state)
+            @show (step, E)
+        end
     end
 
     while true
