@@ -1,7 +1,10 @@
 module Cronenberg
 
-using StaticArrays
+import Blink
+import ColorSchemes
+using Colors: hex
 using Random: shuffle!
+using StaticArrays
 
 const Tile = Tuple{UnitRange{Int}, UnitRange{Int}}
 
@@ -91,8 +94,8 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
     tiles = Vector{Vector{Tile}}(undef, 4)
 
     # Chop things into a reasonable number of x y tiles.
-    nytiles = max(1, div(m, nominal_tile_size))
-    nxtiles = max(1, div(n, nominal_tile_size))
+    nytiles = max(1, div(m, nominal_tile_size, RoundUp))
+    nxtiles = max(1, div(n, nominal_tile_size, RoundUp))
     ntiles = nxtiles * nytiles
 
     for quadrant in 1:4
@@ -143,6 +146,11 @@ end
 
 function gettype(world::World, i::Int, j::Int)
     state = getstate(world, i, j)
+    return state == 0 ? 0 : world.types[state]
+end
+
+
+function gettype(world::World, state::Int32)
     return state == 0 ? 0 : world.types[state]
 end
 
@@ -210,6 +218,8 @@ function loss(world::World, rules::RuleSet)
     # everything gets counted in both directions in the above. Correct for this.
     E_adhesion /= 2
 
+    @show (E_area, E_vol, E_adhesion)
+
     return E_area + E_vol + E_adhesion
 end
 
@@ -239,13 +249,13 @@ function Δsource_area(world::World, i_source::Int, j_source::Int, i_dest::Int, 
     Δ = 0
 
     # We lose one area for every neighbor that only had one exposed direction.
-    neighbour_count = 0
+    neighbor_count = 0
     for (i_off, j_off) in NEIGHBORS
         i, j = i_dest + i_off, j_dest + j_off
         if 1 <= i <= m && 1 <= j <= n
             if world.state[i, j] == source_state
-                neighbour_count += 1
-                if count_ones(world.neighbors[i, j]) == 1
+                neighbor_count += 1
+                if count_zeros(world.neighbors[i, j]) == 1
                     Δ -= 1
                 end
             end
@@ -253,7 +263,7 @@ function Δsource_area(world::World, i_source::Int, j_source::Int, i_dest::Int, 
     end
 
     # Add one for the new pixel, if it's not surrounding.
-    if neighbour_count != 8
+    if neighbor_count != 8
         Δ += 1
     end
 
@@ -269,12 +279,12 @@ function Δdest_area(world::World, i_source::Int, j_source::Int, i_dest::Int, j_
 
     # Gain one area for any dest_state pixels that were surrounded but will be
     # no longer.
-    neighbour_count = 0
+    neighbor_count = 0
     for (i_off, j_off) in NEIGHBORS
         i, j = i_dest + i_off, j_dest + j_off
         if 1 <= i <= m && 1 <= j <= n
             if world.state[i, j] == dest_state
-                neighbour_count += 1
+                neighbor_count += 1
                 if count_ones(world.neighbors[i, j]) == 8
                     Δ += 1
                 end
@@ -283,7 +293,7 @@ function Δdest_area(world::World, i_source::Int, j_source::Int, i_dest::Int, j_
     end
 
     # Lose one area if (i_dest, j_dest) was not surrounded
-    if neighbour_count != 8
+    if neighbor_count != 8
         Δ -= 1
     end
 
@@ -356,9 +366,16 @@ function tick(world::World, rules::RuleSet, E::Float32)
     m, n = size(world)
 
     for quadrant in 1:4
+        fill!(world.ΔEs, 0f0)
+
         # Threads.@threads for (k, (yrange, xrange)) in enumerate(world.tiles[quadrant])
         Threads.@threads for k in 1:length(world.tiles[quadrant])
             yrange, xrange = world.tiles[quadrant][k]
+
+            # This can happen in tiles occuring on the edges
+            if isempty(yrange) || isempty(xrange)
+                continue
+            end
 
             # Choose a random pixel with a border. (we do this just by rejection
             # sampling)
@@ -373,9 +390,19 @@ function tick(world::World, rules::RuleSet, E::Float32)
                 continue
             end
 
-            # select the random neighbor
+            # select the random neighbor (keep trying if it's out of bounds)
             i_off, j_off = NEIGHBORS[random_neighbor(world.neighbors[i_source, j_source])]
             i_dest, j_dest = i_source + i_off, j_source + j_off
+            attempts = 20
+            while !(1 <= i_dest <= m && 1 <= j_dest <= n) && attempts > 0
+                i_off, j_off = NEIGHBORS[random_neighbor(world.neighbors[i_source, j_source])]
+                i_dest, j_dest = i_source + i_off, j_source + j_off
+                attempts -= 1
+            end
+
+            if attempts == 0
+                continue
+            end
 
             # Evaluate the energy of copying our state to the neighbors state
             ΔE = Δloss(world, rules, i_source, j_source, i_dest, j_dest)
@@ -421,8 +448,134 @@ function tick(world::World, rules::RuleSet, E::Float32)
 end
 
 
-# TODO: Figure out how to implement a Blink gui, where we send the cell state
-# matrix to the javascript code which then draws it using canvas or whatever.
+function check_area_volume(world::World)
+    volumes = similar(world.volumes)
+    fill!(volumes, 0)
+
+    areas = similar(world.areas)
+    fill!(areas, 0)
+
+    m, n = size(world)
+
+    # for (s, neighbors) in zip(world.state, world.neighbors)
+    for i in 1:m, j in 1:n
+        s = world.state[i, j]
+        neighbors = world.neighbors[i, j]
+
+        if s != 0
+            volumes[s] += 1
+            @assert neighbors == check_neighbors(world.state, i, j)
+            if count_zeros(neighbors) > 0
+                areas[s] += 1
+            end
+        end
+    end
+
+    @assert volumes == world.volumes
+    @assert areas == world.areas
+end
+
+
+const blink_window = Ref{Union{Nothing, Blink.Window}}(nothing)
+
+
+"""
+Draw the world from scratch.
+"""
+function draw_world(win::Blink.Window, world::World, colors::Vector, ntypes::Int)
+    m, n = size(world)
+    for type in 1:ntypes
+        xs = Int[]
+        ys = Int[]
+        for i in 1:m, j in 1:n
+            if gettype(world, i, j) == type
+                push!(ys, i-1)
+                push!(xs, j-1)
+            end
+        end
+
+        if !isempty(xs)
+            color = colors[type]
+            jscall = Blink.JSString("drawcells($m, $n, \"#$(hex(color))\", $xs, $ys)")
+            Blink.js(win, jscall)
+        end
+    end
+end
+
+
+function redraw_world(win::Blink.Window, world::World, prevstate::Matrix{Int32}, colors::Vector, ntypes::Int)
+    m, n = size(world)
+
+    for type in 0:ntypes
+        xs = Int[]
+        ys = Int[]
+        for i in 1:m, j in 1:n
+            type_ij = gettype(world, i, j)
+            prevtype_ij = gettype(world, getstate(prevstate, i, j))
+            if type_ij == type && type_ij != prevtype_ij
+                push!(ys, i-1)
+                push!(xs, j-1)
+            end
+        end
+
+        if !isempty(xs)
+            color = type == 0 ? "FFF" : hex(colors[type])
+            jscall = Blink.JSString("drawcells($m, $n, \"#$(color)\", $xs, $ys)")
+            Blink.js(win, jscall)
+        end
+    end
+end
+
+
+function run(world::World, rules::RuleSet; nsteps::Int=1000, pixelsize::Int=5)
+    m, n = size(world)
+
+    if blink_window[] === nothing || !Blink.active(blink_window[])
+        blink_window[] = Blink.Window()
+    end
+
+    color_scheme = ColorSchemes.colorschemes[
+        :diverging_rainbow_bgymr_45_85_c67_n256]
+    colors = [ColorSchemes.get(color_scheme, i, (1,rules.ntypes)) for i in 1:rules.ntypes]
+
+    scripts = String(read(joinpath(dirname(pathof(Cronenberg)), "draw.js")))
+
+    Blink.body!(
+        blink_window[],
+        """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Cronenberg</title>
+            <script>$(scripts)</script>
+        </head>
+        <body>
+            <canvas id="canvas" width="$(pixelsize*n)" height="$(pixelsize*m)"></canvas>
+        </body>
+        </html>
+        """,
+        async=false)
+
+    draw_world(blink_window[], world, colors, rules.ntypes)
+
+    E = loss(world, rules)
+    prevstate = similar(world.state)
+    for step in 1:nsteps
+        copy!(prevstate, world.state)
+        E = tick(world, rules, E)
+        @show (world.volumes[1], world.areas[1])
+        @show (E, loss(world, rules))
+        redraw_world(blink_window[], world, prevstate, colors, rules.ntypes)
+        sleep(0.05)
+    end
+
+    while true
+        yield()
+    end
+
+    # TODO: What I really want is an interface to advance the simulation,
+    # and some kind of thing to save it.
+end
 
 
 end # module
