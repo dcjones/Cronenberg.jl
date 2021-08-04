@@ -2,7 +2,7 @@ module Cronenberg
 
 import Blink
 import ColorSchemes
-using Colors: hex
+using Colors: hex, LCHab, RGB
 using Random: shuffle!
 using StaticArrays
 
@@ -59,6 +59,15 @@ struct World
     # by a specific cell.
     state::Matrix{Int32}
 
+    # Used to keep track of changes to redraw world efficiently
+    prev_state::Matrix{Int32}
+
+    # True if the the pixel is occupied and a border
+    border::BitMatrix
+
+    # Used to keep track of previous state
+    prev_border::BitMatrix
+
     # For each quadrant, a vector of tiles
     tiles::Vector{Vector{Tile}}
 
@@ -74,9 +83,13 @@ struct World
     volumes::Vector{Int32} # technically area in 2d world
     areas::Vector{Int32} # technically circumfrence in 2d world
 
+    # used to test for connected components
+    visited::BitMatrix
+
     # used to keep track of change in energy at each tile
     ΔEs::Array{Float32}
 end
+
 
 
 function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::Int=80)
@@ -89,41 +102,40 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
     coords = [(i,j) for i in 1:m, j in 1:n]
     shuffle!(coords)
 
-    # for k in 1:ncells
-    #     i, j = coords[k]
-    #     state[i, j] = k
-    #     types[k] = rand(1:ncelltype)
-    #     volumes[k] = 1
-    #     areas[k] = 1
-    # end
-
-    # Clumpier initialization: choose random rectangles, choose a random
-    # cell type, put some cells in there
-    ncells_remaining = ncells
-    max_cells_per_rect = 200
-    while ncells_remaining > 0
-        h = rand(1:m)
-        w = rand(1:n)
-        i0 = rand(1:(m - h + 1))
-        j0 = rand(1:(n - w + 1))
-        i1 = i0 + h - 1
-        j1 = j0 + w - 1
-
-        type = rand(1:ncelltype)
-        nrectcells = min(ncells_remaining, rand(1:max_cells_per_rect))
-        @show nrectcells
-
-        for i in 1:nrectcells
-            i = rand(i0:i1)
-            j = rand(j0:j1)
-            state[i, j] = ncells_remaining
-            types[ncells_remaining] = type
-            volumes[ncells_remaining] = 1
-            areas[ncells_remaining] = 1
-            ncells_remaining -= 1
-        end
+    for k in 1:ncells
+        i, j = coords[k]
+        state[i, j] = k
+        types[k] = rand(1:ncelltype)
+        volumes[k] = 1
+        areas[k] = 1
     end
 
+    # # Clumpier initialization: choose random rectangles, choose a random
+    # # cell type, put some cells in there
+    # ncells_remaining = ncells
+    # max_cells_per_rect = 200
+    # while ncells_remaining > 0
+    #     h = rand(1:m)
+    #     w = rand(1:n)
+    #     i0 = rand(1:(m - h + 1))
+    #     j0 = rand(1:(n - w + 1))
+    #     i1 = i0 + h - 1
+    #     j1 = j0 + w - 1
+
+    #     type = rand(1:ncelltype)
+    #     nrectcells = min(ncells_remaining, rand(1:max_cells_per_rect))
+    #     @show nrectcells
+
+    #     for i in 1:nrectcells
+    #         i = rand(i0:i1)
+    #         j = rand(j0:j1)
+    #         state[i, j] = ncells_remaining
+    #         types[ncells_remaining] = type
+    #         volumes[ncells_remaining] = 1
+    #         areas[ncells_remaining] = 1
+    #         ncells_remaining -= 1
+    #     end
+    # end
 
     # Build neighbors matrix
     neighbors = check_neighbors(state)
@@ -162,8 +174,24 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
 
     ΔEs = Array{Float32}(undef, ntiles)
 
+    visited = BitMatrix(undef, (m, n))
+    fill!(visited, false)
+
+    border = BitMatrix(undef, (m, n))
+    fill!(border, false)
+
     return World(
-        state, tiles, neighbors, types, volumes, areas, ΔEs)
+        state, similar(state), border, similar(border), tiles,
+        neighbors, types, volumes, areas, visited, ΔEs)
+end
+
+
+"""
+Store the current (world.state, world.border) in (world.prev_state, world.prev_border)
+"""
+function savestate!(world::World)
+    copy!(world.prev_state, world.state)
+    copy!(world.prev_border, world.border)
 end
 
 
@@ -195,6 +223,37 @@ function gettype(world::World, state::Int32)
 end
 
 
+function isborder(world::World, i::Int, j::Int)
+    return count_ones(world.neighbors[i, j]) < length(NEIGHBORS)
+end
+
+
+function findborders!(world::World)
+    m, n = size(world)
+    fill!(world.border, false)
+    Threads.@threads for i in 1:m
+        for j in 1:n
+            world.border[i, j] = isborder(world, i, j)
+        end
+    end
+end
+
+
+"""
+Recompute the neighbors array from scratch. Shouldn't be necessary, since we
+update in incrementally.
+"""
+function findneighbors!(world::World)
+    m, n = size(world)
+    fill!(world.neighbors, 0)
+    Threads.@threads for i in 1:m
+        for j in 1:n
+            world.neighbors[i, j] = check_neighbors(world.state, i, j)
+        end
+    end
+end
+
+
 """
 Check each neighbor of (i,j) and record whether the share a state in a UInt8
 """
@@ -208,15 +267,6 @@ function check_neighbors(world_state::Matrix{Int32}, i::Int, j::Int)
     for (k, (i_off, j_off)) in enumerate(NEIGHBORS)
         neighbors |= (state == getstate(world_state, i+i_off, j+j_off)) << (k-1)
     end
-
-    # neighbors |= (state != getstate(world_state, i-1, j))
-    # neighbors |= (state != getstate(world_state, i-1, j+1)) << 1
-    # neighbors |= (state != getstate(world_state, i,   j+1)) << 2
-    # neighbors |= (state != getstate(world_state, i+1, j+1)) << 3
-    # neighbors |= (state != getstate(world_state, i+1, j))   << 4
-    # neighbors |= (state != getstate(world_state, i+1, j-1)) << 5
-    # neighbors |= (state != getstate(world_state, i,   j-1)) << 6
-    # neighbors |= (state != getstate(world_state, i-1, j-1)) << 7
 
     return neighbors
 end
@@ -382,13 +432,13 @@ function Δloss(
 
         # Don't let any cells disappear entirely
         if world.volumes[dest_state] == 1
-            ΔE_vol = Inf32
+            return Inf32
         end
 
-        # TODO: Cells need to remain connected components. Check if this move
-        # would disconnect the cell, and if so set ΔE to Inf32.
-        #
-        # How to we affordably check this?
+        # Don't let any cells break into pieces
+        if !remains_connected(world, i_dest, j_dest)
+            return Inf32
+        end
     end
 
     # recompute adhesion scores in light of (i_dest, j_dest) being set to type `source_state`
@@ -403,6 +453,67 @@ function Δloss(
     # @show (source_type, dest_type, ΔE_area, ΔE_vol, ΔE_adhesion)
 
     return ΔE_area + ΔE_vol + ΔE_adhesion
+end
+
+
+"""
+Checks whether a cell remains a connected components after removing it's pixel
+at (i, j)
+"""
+function remains_connected(world::World, i::Int, j::Int)
+    state = getstate(world, i, j)
+    @assert state != 0
+
+    i_min, i_max = 1, 0
+    j_min, j_max = 1, 0
+
+    # traverse the cell starting at an arbitrary neighbor, keeping track of
+    # visited pixels
+    for (i_off, j_off) in NEIGHBORS
+        i_next, j_next = i + i_off, j + j_off
+        if getstate(world, i_next, j_next) == state
+            i_min, i_max, j_min, j_max = traverse_cell(
+                world, state, i_next, j_next, i, j, i_min, i_max, j_min, j_max)
+             break
+        end
+    end
+
+    # check that each neighbor of the same state was visited
+    for (i_off, j_off) in NEIGHBORS
+        i_next, j_next = i + i_off, j + j_off
+        if getstate(world, i_next, j_next) == state && !world.visited[i_next, j_next]
+            world.visited[i_min:i_max,j_min:j_max] .= false
+            return false
+        end
+    end
+
+    # clear visited rect
+    world.visited[i_min:i_max,j_min:j_max] .= false
+    return true
+end
+
+
+function traverse_cell(
+        world::World, state::Int32, i::Int, j::Int, i_excluded::Int, j_excluded::Int,
+        i_min::Int, i_max::Int, j_min::Int, j_max::Int)
+
+    world.visited[i, j] = true
+    i_min, i_max = min(i_min, i), max(i_max, i)
+    j_min, j_max = min(j_min, j), max(j_max, j)
+
+    for (i_off, j_off) in NEIGHBORS
+        i_next, j_next = i + i_off, j + j_off
+        if getstate(world, i_next, j_next) == state &&
+                !world.visited[i_next, j_next] &&
+                !(i_next == i_excluded && j_next == j_excluded)
+            i_min, i_max, j_min, j_max =
+                traverse_cell(
+                    world, state, i_next, j_next, i_excluded, j_excluded,
+                    i_min, i_max, j_min, j_max)
+        end
+    end
+
+    return i_min, i_max, j_min, j_max
 end
 
 
@@ -532,50 +643,86 @@ end
 const blink_window = Ref{Union{Nothing, Blink.Window}}(nothing)
 
 
+function clear_world(win::Blink.Window, bgcolor="white")
+    Blink.js(win, Blink.JSString("clearcells(\"$(bgcolor)\")"))
+end
+
+
+
 """
 Draw the world from scratch.
 """
 function draw_world(win::Blink.Window, world::World, colors::Vector, ntypes::Int)
     m, n = size(world)
-    for type in 1:ntypes
-        xs = Int[]
-        ys = Int[]
+    xs = Int[]
+    ys = Int[]
+
+    function collect_and_draw(color, type, border)
+        empty!(xs)
+        empty!(ys)
+
         for i in 1:m, j in 1:n
-            if gettype(world, i, j) == type
+            if gettype(world, i, j) == type && (border == world.border[i, j])
                 push!(ys, i-1)
                 push!(xs, j-1)
             end
         end
 
         if !isempty(xs)
-            color = colors[type]
             jscall = Blink.JSString("drawcells($m, $n, \"#$(hex(color))\", $xs, $ys)")
             Blink.js(win, jscall)
         end
     end
+
+    for type in 1:ntypes
+        # draw border cells by darkening the color
+        color = colors[type]
+        border_color = convert(LCHab, color)
+        border_color = LCHab(border_color.l - 30.0, border_color.c, border_color.h)
+
+        collect_and_draw(border_color, type, true)
+        collect_and_draw(color, type, false )
+    end
 end
 
 
-function redraw_world(win::Blink.Window, world::World, prevstate::Matrix{Int32}, colors::Vector, ntypes::Int)
+function redraw_world(win::Blink.Window, world::World, colors::Vector, ntypes::Int)
     m, n = size(world)
+    xs = Int[]
+    ys = Int[]
 
-    for type in 0:ntypes
-        xs = Int[]
-        ys = Int[]
+    function collect_and_draw(color, type, border)
+        empty!(xs)
+        empty!(ys)
+
         for i in 1:m, j in 1:n
-            type_ij = gettype(world, i, j)
-            prevtype_ij = gettype(world, getstate(prevstate, i, j))
-            if type_ij == type && type_ij != prevtype_ij
+            changed =
+                world.state[i, j] != world.prev_state[i, j] ||
+                world.border[i, j] != world.prev_border[i, j]
+
+            if changed && gettype(world, i, j) == type && (border == world.border[i, j])
                 push!(ys, i-1)
                 push!(xs, j-1)
             end
         end
 
         if !isempty(xs)
-            color = type == 0 ? "FFF" : hex(colors[type])
-            jscall = Blink.JSString("drawcells($m, $n, \"#$(color)\", $xs, $ys)")
+            jscall = Blink.JSString("drawcells($m, $n, \"#$(hex(color))\", $xs, $ys)")
             Blink.js(win, jscall)
         end
+    end
+
+    for type in 0:ntypes
+        if type > 0
+            color = colors[type]
+            border_color = convert(LCHab, color)
+            border_color = LCHab(border_color.l - 30.0, border_color.c, border_color.h)
+        else
+            border_color = color = RGB(1,1,1)
+        end
+
+        collect_and_draw(border_color, type, true)
+        collect_and_draw(color, type, false)
     end
 end
 
@@ -609,11 +756,12 @@ function run(world::World, rules::RuleSet; nsteps::Int=10000, pixelsize::Int=3)
         """,
         async=false)
 
+    findborders!(world)
+    clear_world(blink_window[], "white")
     draw_world(blink_window[], world, colors, rules.ntypes)
+    savestate!(world)
 
     E = loss(world, rules)
-    prevstate = similar(world.state)
-    copy!(prevstate, world.state)
 
     for step in 1:nsteps
         E = tick(world, rules, E)
@@ -621,9 +769,14 @@ function run(world::World, rules::RuleSet; nsteps::Int=10000, pixelsize::Int=3)
         # @show (maximum(world.volumes), maximum(world.areas))
         # @show (E, loss(world, rules))
         # sleep(0.05)
-        if step % 1000 == 0
-            redraw_world(blink_window[], world, prevstate, colors, rules.ntypes)
-            copy!(prevstate, world.state)
+        if step % 100 == 0
+            findborders!(world)
+            redraw_world(blink_window[], world, colors, rules.ntypes)
+
+            # clear_world(blink_window[], "white")
+            # draw_world(blink_window[], world, colors, rules.ntypes)
+
+            savestate!(world)
             @show (step, E)
         end
     end
