@@ -52,13 +52,15 @@ struct RuleSet
     # cell adhesion scores, by cell types + 1
     adhesion::Matrix{Float32}
 
+    self_adhesion::Float32
+
     # target volume (by cell type)
     target_volume::Vector{Int32}
-    elasticity_volume::Vector{Float32}
+    rigidity_volume::Vector{Float32}
 
     # target surface area (by cell type)
     target_area::Vector{Int32}
-    elasticity_area::Vector{Float32}
+    rigidity_area::Vector{Float32}
 
     # Maximimum act values, set when pixels flip, then decayed.
     act_max::Int32
@@ -71,34 +73,39 @@ Generate a random "reasonable" rule set with the given number of celltypes.
 function RuleSet(ncelltypes::Int)
 
     target_volume = Int32[rand(30:100) for _ in 1:ncelltypes]
-    elasticity_volume = fill(0.5f0, ncelltypes)
+    rigidity_volume = fill(0.5f0, ncelltypes)
 
     # Target area is a sphere
     target_area = Int32[round(Int, π*sqrt(vol), RoundUp) for vol in target_volume]
-    elasticity_area = fill(0.05f0, ncelltypes)
+    rigidity_area = fill(0.05f0, ncelltypes)
 
     adhesion = zeros(Float32, (ncelltypes+1, ncelltypes+1))
 
     for i in 2:ncelltypes+1
+        # adhesion[i, i] = -2.0
+
         candidates = shuffle((i+1):ncelltypes+1)
 
         # choose some celltypes disliked by i
         for j in candidates
-            if rand() < 0.1
-                adhesion[i, j] = adhesion[j, i] = 2.0
+            if rand() < 0.3
+                adhesion[i, j] = adhesion[j, i] = 5.0
             elseif rand() < 0.1
-                adhesion[i, j] = adhesion[j, i] = -2.0
+                adhesion[i, j] = adhesion[j, i] = -1.0
             end
         end
     end
 
+    self_adhesion = -2.0
+
     return Cronenberg.RuleSet(
       ncelltypes,
       adhesion,
+      self_adhesion,
       target_volume,
-      elasticity_volume,
+      rigidity_volume,
       target_area,
-      elasticity_area,
+      rigidity_area,
       5)
 end
 
@@ -389,8 +396,8 @@ end
 Evaluate the free energy function from scratch across the whole world
 """
 function loss(world::World, rules::RuleSet)
-    E_area = sum(rules.elasticity_area[world.types] .* (rules.target_area[world.types] .- world.areas).^2)
-    E_vol = sum(rules.elasticity_volume[world.types] .* (rules.target_volume[world.types] .- world.volumes).^2)
+    E_area = sum(rules.rigidity_area[world.types] .* (rules.target_area[world.types] .- world.areas).^2)
+    E_vol = sum(rules.rigidity_volume[world.types] .* (rules.target_volume[world.types] .- world.volumes).^2)
 
     E_adhesion = 0.0f0
     m, n = size(world.state)
@@ -399,15 +406,21 @@ function loss(world::World, rules::RuleSet)
             continue
         end
 
+        state = getstate(world, i, j)
         type = gettype(world, i, j)
         for (k, (i_off, j_off)) in enumerate(NEIGHBORS)
-            E_adhesion += rules.adhesion[type+1, gettype(world, i+i_off, j+j_off)+1]
+            if getstate(world, i+i_off, j+j_off) == state
+                E_adhesion += rules.self_adhesion
+            else
+                E_adhesion += rules.adhesion[type+1, gettype(world, i+i_off, j+j_off)+1]
+            end
         end
     end
     # everything gets counted in both directions in the above. Correct for this.
     E_adhesion /= 2
 
-    return E_area + E_vol + E_adhesion
+    # return E_area + E_vol + E_adhesion
+    return E_vol + E_adhesion
 end
 
 
@@ -490,32 +503,32 @@ function Δloss(
     dest_type = gettype(world, i_dest, j_dest)
 
     ΔE_vol = 0f0
-    ΔE_area = 0f0
+    # ΔE_area = 0f0
 
     if source_type != 0
-        ΔE_vol += rules.elasticity_volume[source_type] * (
+        ΔE_vol += rules.rigidity_volume[source_type] * (
             (rules.target_volume[source_type] - (world.volumes[source_state] + 1))^2 -
             (rules.target_volume[source_type] - world.volumes[source_state])^2)
 
-        new_area = world.areas[source_state] + Δsource_area(world, i_source, j_source, i_dest, j_dest)
-        ΔE_area += rules.elasticity_area[source_type] * (
-            (rules.target_area[source_type] - new_area)^2 -
-            (rules.target_area[source_type] - world.areas[source_state])^2)
+        # new_area = world.areas[source_state] + Δsource_area(world, i_source, j_source, i_dest, j_dest)
+        # ΔE_area += rules.rigidity_area[source_type] * (
+        #     (rules.target_area[source_type] - new_area)^2 -
+        #     (rules.target_area[source_type] - world.areas[source_state])^2)
     end
 
     if dest_type != 0
-        ΔE_vol += rules.elasticity_volume[dest_type] * (
+        ΔE_vol += rules.rigidity_volume[dest_type] * (
             (rules.target_volume[dest_type] - (world.volumes[dest_state] - 1))^2 -
             (rules.target_volume[dest_type] - world.volumes[dest_state])^2)
 
-        new_area = world.areas[dest_state] + Δdest_area(world, i_source, j_source, i_dest, j_dest)
-        ΔE_area += rules.elasticity_area[dest_type] * (
-            (rules.target_area[dest_type] - new_area)^2 -
-            (rules.target_area[dest_type] - world.areas[dest_state])^2)
+        # new_area = world.areas[dest_state] + Δdest_area(world, i_source, j_source, i_dest, j_dest)
+        # ΔE_area += rules.rigidity_area[dest_type] * (
+        #     (rules.target_area[dest_type] - new_area)^2 -
+        #     (rules.target_area[dest_type] - world.areas[dest_state])^2)
 
         # Don't let any cells disappear entirely
         if world.volumes[dest_state] == 1
-            return Inf32
+            return Inf32, Inf32
         end
 
         # TODO: This is super expensive, and maybe not necessary
@@ -530,15 +543,27 @@ function Δloss(
     for (i_off, j_off) in NEIGHBORS
         i, j = i_dest + i_off, j_dest + j_off
         neighbor_type = gettype(world, i, j)
-        ΔE_adhesion -= rules.adhesion[neighbor_type + 1, dest_type + 1]
-        ΔE_adhesion += rules.adhesion[neighbor_type + 1, source_type + 1]
+        neighbor_state = getstate(world, i, j)
+
+        if neighbor_state == dest_state
+            ΔE_adhesion -= rules.self_adhesion
+        else
+            ΔE_adhesion -= rules.adhesion[neighbor_type + 1, dest_type + 1]
+        end
+
+        if neighbor_state == source_state
+            ΔE_adhesion += rules.self_adhesion
+        else
+            ΔE_adhesion += rules.adhesion[neighbor_type + 1, source_type + 1]
+        end
     end
 
     # If dest site is not very active, and source site is very active,
     # energy in reduced in the copy.
     ΔE_act = gmact(world, i_dest, j_dest) - gmact(world, i_source, j_source)
 
-    return ΔE_area + ΔE_vol + ΔE_adhesion + ΔE_act
+    # return ΔE_area + ΔE_vol + ΔE_adhesion + ΔE_act
+    return ΔE_vol + ΔE_adhesion, ΔE_act
 end
 
 
@@ -690,21 +715,22 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
             end
 
             # Evaluate the energy of copying our state to the neighbors state
-            ΔE = Δloss(world, rules, i_source, j_source, i_dest, j_dest)
+            ΔE, ΔE_act = Δloss(world, rules, i_source, j_source, i_dest, j_dest)
+            ΔE_total = ΔE + ΔE_act
 
             # accept?
-            if ΔE < 0 || rand() < exp(-ΔE/T)
+            if ΔE_total < 0 || rand() < exp(-ΔE_total/T)
                 source_state = getstate(world, i_source, j_source)
                 dest_state = getstate(world, i_dest, j_dest)
 
                 if source_state != 0
                     world.volumes[source_state] += 1
-                    world.areas[source_state] += Δsource_area(world, i_source, j_source, i_dest, j_dest)
+                    # world.areas[source_state] += Δsource_area(world, i_source, j_source, i_dest, j_dest)
                 end
 
                 if dest_state != 0
                     world.volumes[dest_state] -= 1
-                    world.areas[dest_state] += Δdest_area(world, i_source, j_source, i_dest, j_dest)
+                    # world.areas[dest_state] += Δdest_area(world, i_source, j_source, i_dest, j_dest)
                 end
 
                 world.state[i_dest, j_dest] = source_state
@@ -722,6 +748,8 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
                         world.neighbors[i, j] = findneighbors(world.state, i, j)
                     end
                 end
+
+                # TODO: I should maybe no accumulate act energies?
 
                 world.ΔEs[k] = ΔE
             else
