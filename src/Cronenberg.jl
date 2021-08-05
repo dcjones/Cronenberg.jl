@@ -97,6 +97,7 @@ function RuleSet(ncelltypes::Int)
     end
 
     self_adhesion = -2.0
+    act_max = 10
 
     return Cronenberg.RuleSet(
       ncelltypes,
@@ -106,7 +107,7 @@ function RuleSet(ncelltypes::Int)
       rigidity_volume,
       target_area,
       rigidity_area,
-      5)
+      act_max)
 end
 
 
