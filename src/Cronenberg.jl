@@ -76,21 +76,18 @@ struct World
     # Used to keep track of changes to redraw world efficiently
     prev_state::Matrix{Int32}
 
-    # True if the the pixel is occupied and a border
-    border::BitMatrix
+    # For each pixel, record whether each of its 8 neighbors has the same
+    # state, and encode in a UInt8
+    neighbors::Matrix{UInt8}
 
-    # Used to keep track of previous state
-    prev_border::BitMatrix
+    # Used to keep track of the previous state
+    prev_neighbors::Matrix{UInt8}
 
     # Actin value, used for the Act model of cell migration
     act::Matrix{Int32}
 
     # For each quadrant, a vector of tiles
     tiles::Matrix{Tile}
-
-    # For each pixel, record whether each of its 8 neighbors has the same
-    # state, and encode in a UInt8
-    neighbors::Matrix{UInt8}
 
     # cell type indexed by cell state + 1 (unoccpied is represented as its own
     # state)
@@ -109,13 +106,14 @@ end
 
 
 
-function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::Int=80)
+function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::Int=40)
     # Generate a bunch of single pixel cells, placed uniformly at random.
     state = zeros(Int32, (m, n))
     types = zeros(Int32, ncells)
     volumes = zeros(Int32, ncells)
     areas = zeros(Int32, ncells)
 
+    # Uniform random initialization
     coords = [(i,j) for i in 1:m, j in 1:n]
     shuffle!(coords)
 
@@ -126,6 +124,9 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
         volumes[k] = 1
         areas[k] = 1
     end
+
+    # TODO: Maybe we could generate random splines and dump cells out around
+    # that spline to reward formation of "sheets"
 
     # # Clumpier initialization: choose random rectangles, choose a random
     # # cell type, put some cells in there
@@ -155,7 +156,7 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
     # end
 
     # Build neighbors matrix
-    neighbors = check_neighbors(state)
+    neighbors = findneighbors(state)
 
     # Divide the space into tiles.
 
@@ -190,23 +191,20 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
     visited = BitMatrix(undef, (m, n))
     fill!(visited, false)
 
-    border = BitMatrix(undef, (m, n))
-    fill!(border, false)
-
     act = zeros(Int32, (m, n))
 
     return World(
-        state, similar(state), border, similar(border), act, tiles,
-        neighbors, types, volumes, areas, visited, ΔEs)
+        state, similar(state), neighbors, similar(neighbors),
+        act, tiles, types, volumes, areas, visited, ΔEs)
 end
 
 
 """
-Store the current (world.state, world.border) in (world.prev_state, world.prev_border)
+Store the current (world.state, world.neighbors) in (world.prev_state, world.prev_neighbors)
 """
 function savestate!(world::World)
     copy!(world.prev_state, world.state)
-    copy!(world.prev_border, world.border)
+    copy!(world.prev_neighbors, world.neighbors)
 end
 
 
@@ -245,22 +243,12 @@ function getact(world::World, state::Int32, i::Int, j::Int)
 end
 
 
-function isborder(world::World, i::Int, j::Int)
-    return count_ones(world.neighbors[i, j]) < length(NEIGHBORS)
-end
-
-
 """
-Compute the `borders` bit array from scratch.
+Check if the position is a border.
 """
-function findborders!(world::World)
-    m, n = size(world)
-    fill!(world.border, false)
-    Threads.@threads for i in 1:m
-        for j in 1:n
-            world.border[i, j] = isborder(world, i, j)
-        end
-    end
+function isborder(neighbors::Matrix{UInt8}, i::Int, j::Int)
+    m, n = size(neighbors)
+    return neighbors[i, j] != 0 || i == 1 || i == m || j == 1 || j == n
 end
 
 
@@ -318,7 +306,7 @@ end
 """
 Check each neighbor of (i,j) and record whether the share a state in a UInt8
 """
-function check_neighbors(world_state::Matrix{Int32}, i::Int, j::Int)
+function findneighbors(world_state::Matrix{Int32}, i::Int, j::Int)
     m, n = size(world_state)
 
     # check neighbors numbered clockwise
@@ -326,20 +314,26 @@ function check_neighbors(world_state::Matrix{Int32}, i::Int, j::Int)
 
     neighbors = UInt8(0)
     for (k, (i_off, j_off)) in enumerate(NEIGHBORS)
-        neighbors |= (state == getstate(world_state, i+i_off, j+j_off)) << (k-1)
+        i_neighbor, j_neighbor = i+i_off, j+j_off
+        if 1 <= i_neighbor <= m && 1 <= j_neighbor <= n && world_state[i_neighbor, j_neighbor] != state
+            neighbors |= 1 << (k-1)
+        end
     end
 
     return neighbors
 end
 
 
-function check_neighbors(world_state::Matrix{Int32})
+"""
+Compute and return a full neighbor matrix from scratch.
+"""
+function findneighbors(world_state::Matrix{Int32})
     m, n = size(world_state)
     neighbors = zeros(UInt8, (m, n))
 
     Threads.@threads for i in 1:m
         for j in 1:n
-            neighbors[i,j] = check_neighbors(world_state, i, j)
+            neighbors[i,j] = findneighbors(world_state, i, j)
         end
     end
 
@@ -355,37 +349,21 @@ function loss(world::World, rules::RuleSet)
     E_vol = sum(rules.elasticity_volume[world.types] .* (rules.target_volume[world.types] .- world.volumes).^2)
 
     E_adhesion = 0.0f0
-    m, n = size(world.neighbors)
+    m, n = size(world.state)
     for i in 1:m, j in 1:n
-        neighbors = world.neighbors[i, j]
-        type = gettype(world, i, j)
+        if world.neighbors[i, j] == 0
+            continue
+        end
 
-        if neighbors != 0
-            for (k, (i_off, j_off)) in enumerate(NEIGHBORS)
-                E_adhesion += rules.adhesion[type+1, gettype(world, i+i_off, j+j_off)+1]
-            end
+        type = gettype(world, i, j)
+        for (k, (i_off, j_off)) in enumerate(NEIGHBORS)
+            E_adhesion += rules.adhesion[type+1, gettype(world, i+i_off, j+j_off)+1]
         end
     end
     # everything gets counted in both directions in the above. Correct for this.
     E_adhesion /= 2
 
-    # @show (E_area, E_vol, E_adhesion)
-
     return E_area + E_vol + E_adhesion
-end
-
-
-function random_neighbor(neighbors::UInt8)
-    nth_zero = rand(1:(length(NEIGHBORS) - count_ones(neighbors)))
-    for i in 1:length(NEIGHBORS)
-        if (neighbors >> (i-1)) & 0x1 == 0
-            nth_zero -= 1
-            if nth_zero == 0
-                return i
-            end
-        end
-    end
-    error("Pixel has no neighbors with different state.")
 end
 
 
@@ -406,7 +384,7 @@ function Δsource_area(world::World, i_source::Int, j_source::Int, i_dest::Int, 
         if 1 <= i <= m && 1 <= j <= n
             if world.state[i, j] == source_state
                 neighbor_count += 1
-                if (length(NEIGHBORS) - count_ones(world.neighbors[i, j])) == 1
+                if count_ones(world.neighbors[i, j]) == 1
                     Δ -= 1
                 end
             end
@@ -436,7 +414,7 @@ function Δdest_area(world::World, i_source::Int, j_source::Int, i_dest::Int, j_
         if 1 <= i <= m && 1 <= j <= n
             if world.state[i, j] == dest_state
                 neighbor_count += 1
-                if count_ones(world.neighbors[i, j]) == length(NEIGHBORS)
+                if count_ones(world.neighbors[i, j]) == 0
                     Δ += 1
                 end
             end
@@ -496,10 +474,11 @@ function Δloss(
             return Inf32
         end
 
+        # TODO: This is super expensive, and maybe not necessary
         # Don't let any cells break into pieces
-        if !remains_connected(world, i_dest, j_dest)
-            return Inf32
-        end
+        # if !remains_connected(world, i_dest, j_dest)
+        #     return Inf32
+        # end
     end
 
     # recompute adhesion scores in light of (i_dest, j_dest) being set to type `source_state`
@@ -601,43 +580,51 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
                 continue
             end
 
-            # Choose a random pixel with a border. (we do this just by rejection
-            # sampling)
-            i_source, j_source = rand(yrange), rand(xrange)
-            attempts = 1000
-            while (length(NEIGHBORS) - count_ones(world.neighbors[i_source, j_source])) == 0 && attempts > 0
-                i_source, j_source = rand(yrange), rand(xrange)
-                attempts -= 1
+            # Count the number of pixels with a neighbor of a different state
+            # then select one uniformly at random
+            nborder_pixels = 0
+            @inbounds for i in xrange, j in yrange
+                nborder_pixels += world.neighbors[i, j] != 0
             end
 
-            # @show (k, i_source, j_source, getstate(world, i_source, j_source), count_ones(world.neighbors[i_source, j_source]))
-
-            if attempts == 0
+            if nborder_pixels == 0
                 continue
             end
 
-            # select the random neighbor (keep trying if it's out of bounds)
-            i_off, j_off = NEIGHBORS[random_neighbor(world.neighbors[i_source, j_source])]
-            i_dest, j_dest = i_source + i_off, j_source + j_off
-            attempts = 20
-            while !(1 <= i_dest <= m && 1 <= j_dest <= n) && attempts > 0
-                i_off, j_off = NEIGHBORS[random_neighbor(world.neighbors[i_source, j_source])]
-                i_dest, j_dest = i_source + i_off, j_source + j_off
-                attempts -= 1
+            source_border_pos = rand(1:nborder_pixels)
+            i_source, j_source = 0, 0
+            @inbounds for i in xrange, j in yrange
+                if world.neighbors[i, j] != 0
+                    if source_border_pos == 1
+                        i_source, j_source = i, j
+                        break
+                    else
+                        source_border_pos -= 1
+                    end
+                end
             end
+            @assert i_source != 0 && j_source != 0
 
-            if attempts == 0
-                continue
+            # Count the number of neighbors of (i_source, j_source) with
+            # a different state and choose one uniformly at random.
+            neighbors = world.neighbors[i_source, j_source]
+            nneighbors = count_ones(neighbors)
+            dest_pos = rand(1:nneighbors)
+            i_dest, j_dest = 0, 0
+            for l in 1:length(NEIGHBORS)
+                if (neighbors >> (l-1)) & 0x1 == 1
+                    if dest_pos == 1
+                        i_off, j_off = NEIGHBORS[l]
+                        i_dest, j_dest = i_source + i_off, j_source + j_off
+                    else
+                        dest_pos -= 1
+                    end
+                end
             end
+            @assert i_dest != 0 && j_dest != 0
 
             # Evaluate the energy of copying our state to the neighbors state
             ΔE = Δloss(world, rules, i_source, j_source, i_dest, j_dest)
-
-            # TODO: take into account act values here
-
-
-            # @show (gettype(world, i_source, j_source), gettype(world, i_dest, j_dest))
-            # @show ΔE
 
             # accept?
             if ΔE < 0 || rand() < exp(-ΔE/T)
@@ -660,13 +647,13 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
                 end
 
                 # Set neighbors for (i_dest, j_dest)
-                world.neighbors[i_dest, j_dest] = check_neighbors(world.state, i_dest, j_dest)
+                world.neighbors[i_dest, j_dest] = findneighbors(world.state, i_dest, j_dest)
 
                 # Set neighbors for each of (i_dest, j_dests)'s neighbors
                 for (k, (i_off, j_off)) in enumerate(NEIGHBORS)
                     i, j = i_dest + i_off, j_dest + j_off
                     if 1 <= i <= m && 1 <= j <= n
-                        world.neighbors[i, j] = check_neighbors(world.state, i, j)
+                        world.neighbors[i, j] = findneighbors(world.state, i, j)
                     end
                 end
 
@@ -699,7 +686,7 @@ function check_area_volume(world::World)
 
         if s != 0
             volumes[s] += 1
-            @assert neighbors == check_neighbors(world.state, i, j)
+            @assert neighbors == findneighbors(world.state, i, j)
             if (length(NEIGHBORS) - count_ones(neighbors)) > 0
                 areas[s] += 1
             end
@@ -741,7 +728,7 @@ function draw_world(win::Blink.Window, world::World, colors::Vector, ntypes::Int
         empty!(ys)
 
         for i in 1:m, j in 1:n
-            if gettype(world, i, j) == type && (border == world.border[i, j])
+            if gettype(world, i, j) == type && (border == isborder(world.neighbors, i, j))
                 push!(ys, i-1)
                 push!(xs, j-1)
             end
@@ -777,9 +764,9 @@ function redraw_world(win::Blink.Window, world::World, colors::Vector, ntypes::I
         for i in 1:m, j in 1:n
             changed =
                 world.state[i, j] != world.prev_state[i, j] ||
-                world.border[i, j] != world.prev_border[i, j]
+                isborder(world.neighbors, i, j) != isborder(world.prev_neighbors, i, j)
 
-            if changed && gettype(world, i, j) == type && (border == world.border[i, j])
+            if changed && gettype(world, i, j) == type && (border == isborder(world.neighbors, i, j))
                 push!(ys, i-1)
                 push!(xs, j-1)
             end
@@ -787,7 +774,7 @@ function redraw_world(win::Blink.Window, world::World, colors::Vector, ntypes::I
 
         if !isempty(xs)
             jscall = Blink.JSString("drawcells($m, $n, \"#$(hex(color))\", $xs, $ys)")
-            Blink.js(win, jscall)
+            Blink.js(win, jscall, callback=false)
         end
     end
 
@@ -806,7 +793,8 @@ function redraw_world(win::Blink.Window, world::World, colors::Vector, ntypes::I
 end
 
 
-function run(world::World, rules::RuleSet; nsteps::Int=10000, pixelsize::Int=3)
+function run(world::World, rules::RuleSet;
+        nsteps::Int=10000, pixelsize::Int=3, wait_when_done::Bool=true)
     m, n = size(world)
 
     if blink_window[] === nothing || !Blink.active(blink_window[])
@@ -835,7 +823,6 @@ function run(world::World, rules::RuleSet; nsteps::Int=10000, pixelsize::Int=3)
         """,
         async=false)
 
-    findborders!(world)
     clear_world(blink_window[], "white")
     draw_world(blink_window[], world, colors, rules.ntypes)
     savestate!(world)
@@ -850,8 +837,7 @@ function run(world::World, rules::RuleSet; nsteps::Int=10000, pixelsize::Int=3)
         for _ in 1:nticks_per_mcs
             E = tick(world, rules, E)
             step += 1
-            if step % 100 == 0
-                findborders!(world)
+            if step % 500 == 0
                 redraw_world(blink_window[], world, colors, rules.ntypes)
 
                 savestate!(world)
@@ -862,8 +848,10 @@ function run(world::World, rules::RuleSet; nsteps::Int=10000, pixelsize::Int=3)
     end
 
     # TODO: Not actually sure what to do here.
-    while true
-        yield()
+    if wait_when_done
+        while true
+            yield()
+        end
     end
 
     # TODO: What I really want is an interface to advance the simulation,
