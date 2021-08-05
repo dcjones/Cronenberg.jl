@@ -21,6 +21,17 @@ const NEIGHBORS = SA[
     ( 0, -1),
     (-1, -1) ]
 
+const NEIGHBORS_AND_SELF = SA[
+    ( 0,  0),
+    (-1,  0),
+    (-1,  1),
+    ( 0,  1),
+    ( 1,  1),
+    ( 1,  0),
+    ( 1, -1),
+    ( 0, -1),
+    (-1, -1) ]
+
 
 # Without diagonals
 # const NEIGHBORS = SA[
@@ -48,6 +59,9 @@ struct RuleSet
     # target surface area (by cell type)
     target_area::Vector{Int32}
     elasticity_area::Vector{Float32}
+
+    # Maximimum act values, set when pixels flip, then decayed.
+    act_max::Int32
 end
 
 
@@ -68,8 +82,11 @@ struct World
     # Used to keep track of previous state
     prev_border::BitMatrix
 
+    # Actin value, used for the Act model of cell migration
+    act::Matrix{Int32}
+
     # For each quadrant, a vector of tiles
-    tiles::Vector{Vector{Tile}}
+    tiles::Matrix{Tile}
 
     # For each pixel, record whether each of its 8 neighbors has the same
     # state, and encode in a UInt8
@@ -141,18 +158,14 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
     neighbors = check_neighbors(state)
 
     # Divide the space into tiles.
-    tiles = Vector{Vector{Tile}}(undef, 4)
 
     # Chop things into a reasonable number of x y tiles.
     nytiles = max(1, div(m, nominal_tile_size, RoundUp))
     nxtiles = max(1, div(n, nominal_tile_size, RoundUp))
     ntiles = nxtiles * nytiles
+    tiles = Matrix{Tile}(undef, 4, ntiles)
 
     @show ntiles
-
-    for quadrant in 1:4
-        tiles[quadrant] = Vector{Tile}(undef, ntiles)
-    end
 
     tile = 0
     for ytile in 1:nytiles, xtile in 1:nxtiles
@@ -166,10 +179,10 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
         xb = min(xa + div(nominal_tile_size, 2) - 1, n)
         xc = min(xa + nominal_tile_size - 1, n)
 
-        tiles[1][tile] = (ya:yb, xa:xb)
-        tiles[2][tile] = (ya:yb, (xb+1):xc)
-        tiles[3][tile] = ((yb+1):yc, xa:xb)
-        tiles[4][tile] = ((yb+1):yc, (xb+1):xc)
+        tiles[1, tile] = (ya:yb, xa:xb)
+        tiles[2, tile] = (ya:yb, (xb+1):xc)
+        tiles[3, tile] = ((yb+1):yc, xa:xb)
+        tiles[4, tile] = ((yb+1):yc, (xb+1):xc)
     end
 
     ΔEs = Array{Float32}(undef, ntiles)
@@ -180,8 +193,10 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
     border = BitMatrix(undef, (m, n))
     fill!(border, false)
 
+    act = zeros(Int32, (m, n))
+
     return World(
-        state, similar(state), border, similar(border), tiles,
+        state, similar(state), border, similar(border), act, tiles,
         neighbors, types, volumes, areas, visited, ΔEs)
 end
 
@@ -223,11 +238,21 @@ function gettype(world::World, state::Int32)
 end
 
 
+function getact(world::World, state::Int32, i::Int, j::Int)
+    m, n = size(world)
+    return getstate(world, i, j) == state && 1 <= i <= m && 1 <= j <= n ?
+        world.act[i, j] : 0
+end
+
+
 function isborder(world::World, i::Int, j::Int)
     return count_ones(world.neighbors[i, j]) < length(NEIGHBORS)
 end
 
 
+"""
+Compute the `borders` bit array from scratch.
+"""
 function findborders!(world::World)
     m, n = size(world)
     fill!(world.border, false)
@@ -251,6 +276,42 @@ function findneighbors!(world::World)
             world.neighbors[i, j] = check_neighbors(world.state, i, j)
         end
     end
+end
+
+
+"""
+Decay act values by 1, saturating at 0.
+"""
+function decayact!(world::World)
+    m, n = size(world)
+    Threads.@threads for i in 1:m
+        for j in 1:n
+            world.act[i, j] = max(0, world.act[i, j]-1)
+        end
+    end
+end
+
+
+"""
+Geometric mean act value in a moore neighborhood.
+"""
+function gmact(world::World, i::Int, j::Int)
+    m, n = size(world)
+    state = getstate(world, i, j)
+    gm = Int32(1)
+    neighborhood_size = 0
+
+    for (i_off, j_off) in NEIGHBORS_AND_SELF
+        i_neighbor, j_neighbor = i + i_off, j + j_off
+        if getstate(world, i_neighbor, j_neighbor) == state
+            neighborhood_size += 1
+            if 1 <= i_neighbor <= m && 1 <= j_neighbor <= n
+                gm *= world.act[i_neighbor, j_neighbor]
+            end
+        end
+    end
+
+    return Float32(gm)^(1/neighborhood_size)
 end
 
 
@@ -450,9 +511,14 @@ function Δloss(
         ΔE_adhesion += rules.adhesion[neighbor_type + 1, source_type + 1]
     end
 
-    # @show (source_type, dest_type, ΔE_area, ΔE_vol, ΔE_adhesion)
+    # If dest site is not very active, and source site is very active,
+    # energy in reduced in the copy.
+    ΔE_act = gmact(world, i_dest, j_dest) - gmact(world, i_source, j_source)
 
-    return ΔE_area + ΔE_vol + ΔE_adhesion
+    # @show (extrema(world.act), gmact(world, i_dest, j_dest), gmact(world, i_source, j_source))
+    # @show (source_type, dest_type, ΔE_area, ΔE_vol, ΔE_adhesion, ΔE_act)
+
+    return ΔE_area + ΔE_vol + ΔE_adhesion + ΔE_act
 end
 
 
@@ -518,17 +584,17 @@ end
 
 
 """
-Advance the world by one iteration.
+Make a single proposal in every tile.
 """
-function tick(world::World, rules::RuleSet, E::Float32)
+function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
     m, n = size(world)
 
-    for quadrant in 1:4
+    for quadrant in 1:size(world.tiles, 1)
         fill!(world.ΔEs, 0f0)
 
         # Threads.@threads for (k, (yrange, xrange)) in enumerate(world.tiles[quadrant])
-        Threads.@threads for k in 1:length(world.tiles[quadrant])
-            yrange, xrange = world.tiles[quadrant][k]
+        Threads.@threads for k in 1:size(world.tiles, 2)
+            yrange, xrange = world.tiles[quadrant, k]
 
             # This can happen in tiles occuring on the edges
             if isempty(yrange) || isempty(xrange)
@@ -567,11 +633,13 @@ function tick(world::World, rules::RuleSet, E::Float32)
             # Evaluate the energy of copying our state to the neighbors state
             ΔE = Δloss(world, rules, i_source, j_source, i_dest, j_dest)
 
+            # TODO: take into account act values here
+
+
             # @show (gettype(world, i_source, j_source), gettype(world, i_dest, j_dest))
             # @show ΔE
 
             # accept?
-            T = 1.0
             if ΔE < 0 || rand() < exp(-ΔE/T)
                 source_state = getstate(world, i_source, j_source)
                 dest_state = getstate(world, i_dest, j_dest)
@@ -587,6 +655,9 @@ function tick(world::World, rules::RuleSet, E::Float32)
                 end
 
                 world.state[i_dest, j_dest] = source_state
+                if source_state != 0
+                    world.act[i_dest, j_dest] = rules.act_max
+                end
 
                 # Set neighbors for (i_dest, j_dest)
                 world.neighbors[i_dest, j_dest] = check_neighbors(world.state, i_dest, j_dest)
@@ -645,6 +716,14 @@ const blink_window = Ref{Union{Nothing, Blink.Window}}(nothing)
 
 function clear_world(win::Blink.Window, bgcolor="white")
     Blink.js(win, Blink.JSString("clearcells(\"$(bgcolor)\")"))
+end
+
+
+"""
+Draw the world from scratch.
+"""
+function draw_act_world(win::Blink.Window, world::World, act_max::Int32)
+    # TODO: Draw an act heatmap
 end
 
 
@@ -763,24 +842,26 @@ function run(world::World, rules::RuleSet; nsteps::Int=10000, pixelsize::Int=3)
 
     E = loss(world, rules)
 
-    for step in 1:nsteps
-        E = tick(world, rules, E)
-        # @show (world.volumes[1], world.areas[1])
-        # @show (maximum(world.volumes), maximum(world.areas))
-        # @show (E, loss(world, rules))
-        # sleep(0.05)
-        if step % 100 == 0
-            findborders!(world)
-            redraw_world(blink_window[], world, colors, rules.ntypes)
+    ntiles = length(world.tiles)
+    nticks_per_mcs = round(Int, m*n/ntiles)
 
-            # clear_world(blink_window[], "white")
-            # draw_world(blink_window[], world, colors, rules.ntypes)
+    step = 0
+    for mcs in 1:nsteps
+        for _ in 1:nticks_per_mcs
+            E = tick(world, rules, E)
+            step += 1
+            if step % 100 == 0
+                findborders!(world)
+                redraw_world(blink_window[], world, colors, rules.ntypes)
 
-            savestate!(world)
-            @show (step, E)
+                savestate!(world)
+                @show (step, E)
+            end
         end
+        decayact!(world)
     end
 
+    # TODO: Not actually sure what to do here.
     while true
         yield()
     end
