@@ -494,9 +494,6 @@ function Δloss(
     # energy in reduced in the copy.
     ΔE_act = gmact(world, i_dest, j_dest) - gmact(world, i_source, j_source)
 
-    # @show (extrema(world.act), gmact(world, i_dest, j_dest), gmact(world, i_source, j_source))
-    # @show (source_type, dest_type, ΔE_area, ΔE_vol, ΔE_adhesion, ΔE_act)
-
     return ΔE_area + ΔE_vol + ΔE_adhesion + ΔE_act
 end
 
@@ -580,6 +577,16 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
                 continue
             end
 
+            # TODO: A big problem with this approach is that distribution of
+            # proposals is heavily influenced by the tile configuration. On
+            # each pass we try to do an update in each tile, regardless of
+            # relative population.
+
+            # I guess we should scale the number of updates by the border population.
+            #
+            #   1. compute nborder pixels for each tile.
+            #   2. use that to distribute the number of proposal attempts.
+
             # Count the number of pixels with a neighbor of a different state
             # then select one uniformly at random
             nborder_pixels = 0
@@ -616,12 +623,18 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
                     if dest_pos == 1
                         i_off, j_off = NEIGHBORS[l]
                         i_dest, j_dest = i_source + i_off, j_source + j_off
+                        break
                     else
                         dest_pos -= 1
                     end
                 end
             end
             @assert i_dest != 0 && j_dest != 0
+
+            # Avoid setting any pixels at the very edge, otherwise they get stuck on.
+            if i_dest == 1 || i_dest == m || j_dest == 1 || j_dest == n
+                continue
+            end
 
             # Evaluate the energy of copying our state to the neighbors state
             ΔE = Δloss(world, rules, i_source, j_source, i_dest, j_dest)
@@ -701,8 +714,9 @@ end
 const blink_window = Ref{Union{Nothing, Blink.Window}}(nothing)
 
 
-function clear_world(win::Blink.Window, bgcolor="white")
+function clear_world(win::Blink.Window, borderpixels::Int, bgcolor="white", bordercolor="#ddd")
     Blink.js(win, Blink.JSString("clearcells(\"$(bgcolor)\")"))
+    Blink.js(win, Blink.JSString("drawborder($(borderpixels), \"$(bordercolor)\")"))
 end
 
 
@@ -823,7 +837,7 @@ function run(world::World, rules::RuleSet;
         """,
         async=false)
 
-    clear_world(blink_window[], "white")
+    clear_world(blink_window[], pixelsize, "white")
     draw_world(blink_window[], world, colors, rules.ntypes)
     savestate!(world)
 
