@@ -3,7 +3,7 @@ module Cronenberg
 import Blink
 import ColorSchemes
 using Colors: hex, LCHab, RGB
-using Random: shuffle!
+using Random: shuffle, shuffle!
 using StaticArrays
 
 const Tile = Tuple{UnitRange{Int}, UnitRange{Int}}
@@ -47,7 +47,7 @@ with respect to.
 """
 struct RuleSet
     # number of cell types
-    ntypes::Int
+    ncelltypes::Int
 
     # cell adhesion scores, by cell types + 1
     adhesion::Matrix{Float32}
@@ -62,6 +62,44 @@ struct RuleSet
 
     # Maximimum act values, set when pixels flip, then decayed.
     act_max::Int32
+end
+
+
+"""
+Generate a random "reasonable" rule set with the given number of celltypes.
+"""
+function RuleSet(ncelltypes::Int)
+
+    target_volume = Int32[rand(30:100) for _ in 1:ncelltypes]
+    elasticity_volume = fill(0.5f0, ncelltypes)
+
+    # Target area is a sphere
+    target_area = Int32[round(Int, π*sqrt(vol), RoundUp) for vol in target_volume]
+    elasticity_area = fill(0.05f0, ncelltypes)
+
+    adhesion = zeros(Float32, (ncelltypes+1, ncelltypes+1))
+
+    for i in 2:ncelltypes+1
+        candidates = shuffle((i+1):ncelltypes+1)
+
+        # choose some celltypes disliked by i
+        for j in candidates
+            if rand() < 0.1
+                adhesion[i, j] = adhesion[j, i] = 2.0
+            elseif rand() < 0.1
+                adhesion[i, j] = adhesion[j, i] = -2.0
+            end
+        end
+    end
+
+    return Cronenberg.RuleSet(
+      ncelltypes,
+      adhesion,
+      target_volume,
+      elasticity_volume,
+      target_area,
+      elasticity_area,
+      5)
 end
 
 
@@ -89,6 +127,10 @@ struct World
     # For each quadrant, a vector of tiles
     tiles::Matrix{Tile}
 
+    # Used to compute the number of candidate source pixels in each tile,
+    # so we can try to balance tho number of proposals per tile.
+    ncandidates::Vector{Int}
+
     # cell type indexed by cell state + 1 (unoccpied is represented as its own
     # state)
     types::Vector{Int32}
@@ -106,7 +148,7 @@ end
 
 
 
-function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::Int=40)
+function World(rules::RuleSet, m::Int, n::Int, ncells::Int; nominal_tile_size::Int=40)
     # Generate a bunch of single pixel cells, placed uniformly at random.
     state = zeros(Int32, (m, n))
     types = zeros(Int32, ncells)
@@ -120,7 +162,7 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
     for k in 1:ncells
         i, j = coords[k]
         state[i, j] = k
-        types[k] = rand(1:ncelltype)
+        types[k] = rand(1:rules.ncelltypes)
         volumes[k] = 1
         areas[k] = 1
     end
@@ -193,9 +235,11 @@ function World(m::Int, n::Int, ncelltype::Int, ncells::Int; nominal_tile_size::I
 
     act = zeros(Int32, (m, n))
 
+    ncandidates = zeros(Int, ntiles)
+
     return World(
         state, similar(state), neighbors, similar(neighbors),
-        act, tiles, types, volumes, areas, visited, ΔEs)
+        act, tiles, ncandidates, types, volumes, areas, visited, ΔEs)
 end
 
 
@@ -565,11 +609,34 @@ Make a single proposal in every tile.
 function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
     m, n = size(world)
 
+    expected_proposals = 0.0
+
     for quadrant in 1:size(world.tiles, 1)
         fill!(world.ΔEs, 0f0)
 
-        # Threads.@threads for (k, (yrange, xrange)) in enumerate(world.tiles[quadrant])
+        # Compute the number of candidates in each tile
+        fill!(world.ncandidates, 0)
         Threads.@threads for k in 1:size(world.tiles, 2)
+            yrange, xrange = world.tiles[quadrant, k]
+            ncandidates_k = 0
+            @inbounds for i in xrange, j in yrange
+                ncandidates_k += world.neighbors[i, j] != 0
+            end
+            world.ncandidates[k] = ncandidates_k
+        end
+
+        max_candidates = maximum(world.ncandidates)
+        expected_proposals = 0.0
+        for ncandidates in world.ncandidates
+            expected_proposals += ncandidates / max_candidates
+        end
+
+        Threads.@threads for k in 1:size(world.tiles, 2)
+            # Randomly skip sparsely populated tiles
+            if rand() > world.ncandidates[k] / max_candidates
+                continue
+            end
+
             yrange, xrange = world.tiles[quadrant, k]
 
             # This can happen in tiles occuring on the edges
@@ -577,22 +644,9 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
                 continue
             end
 
-            # TODO: A big problem with this approach is that distribution of
-            # proposals is heavily influenced by the tile configuration. On
-            # each pass we try to do an update in each tile, regardless of
-            # relative population.
-
-            # I guess we should scale the number of updates by the border population.
-            #
-            #   1. compute nborder pixels for each tile.
-            #   2. use that to distribute the number of proposal attempts.
-
             # Count the number of pixels with a neighbor of a different state
             # then select one uniformly at random
-            nborder_pixels = 0
-            @inbounds for i in xrange, j in yrange
-                nborder_pixels += world.neighbors[i, j] != 0
-            end
+            nborder_pixels = world.ncandidates[k]
 
             if nborder_pixels == 0
                 continue
@@ -602,11 +656,10 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
             i_source, j_source = 0, 0
             @inbounds for i in xrange, j in yrange
                 if world.neighbors[i, j] != 0
-                    if source_border_pos == 1
+                    source_border_pos -= 1
+                    if source_border_pos == 0
                         i_source, j_source = i, j
                         break
-                    else
-                        source_border_pos -= 1
                     end
                 end
             end
@@ -620,18 +673,18 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
             i_dest, j_dest = 0, 0
             for l in 1:length(NEIGHBORS)
                 if (neighbors >> (l-1)) & 0x1 == 1
-                    if dest_pos == 1
+                    dest_pos -= 1
+                    if dest_pos == 0
                         i_off, j_off = NEIGHBORS[l]
                         i_dest, j_dest = i_source + i_off, j_source + j_off
                         break
-                    else
-                        dest_pos -= 1
                     end
                 end
             end
             @assert i_dest != 0 && j_dest != 0
 
-            # Avoid setting any pixels at the very edge, otherwise they get stuck on.
+            # Avoid setting any pixels at the very edge, otherwise they get stuck
+            # because proposals are never made from an out of bounds source.
             if i_dest == 1 || i_dest == m || j_dest == 1 || j_dest == n
                 continue
             end
@@ -679,10 +732,14 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
         E += sum(world.ΔEs)
     end
 
-    return E
+    return (E, round(Int, expected_proposals))
 end
 
 
+"""
+Function for debugging and testing. Make sure `volumes` and `areas` arrays
+are correct.
+"""
 function check_area_volume(world::World)
     volumes = similar(world.volumes)
     fill!(volumes, 0)
@@ -732,7 +789,7 @@ end
 """
 Draw the world from scratch.
 """
-function draw_world(win::Blink.Window, world::World, colors::Vector, ntypes::Int)
+function draw_world(win::Blink.Window, world::World, colors::Vector, ncelltypes::Int)
     m, n = size(world)
     xs = Int[]
     ys = Int[]
@@ -754,7 +811,7 @@ function draw_world(win::Blink.Window, world::World, colors::Vector, ntypes::Int
         end
     end
 
-    for type in 1:ntypes
+    for type in 1:ncelltypes
         # draw border cells by darkening the color
         color = colors[type]
         border_color = convert(LCHab, color)
@@ -766,7 +823,7 @@ function draw_world(win::Blink.Window, world::World, colors::Vector, ntypes::Int
 end
 
 
-function redraw_world(win::Blink.Window, world::World, colors::Vector, ntypes::Int)
+function redraw_world(win::Blink.Window, world::World, colors::Vector, ncelltypes::Int)
     m, n = size(world)
     xs = Int[]
     ys = Int[]
@@ -792,7 +849,7 @@ function redraw_world(win::Blink.Window, world::World, colors::Vector, ntypes::I
         end
     end
 
-    for type in 0:ntypes
+    for type in 0:ncelltypes
         if type > 0
             color = colors[type]
             border_color = convert(LCHab, color)
@@ -817,7 +874,7 @@ function run(world::World, rules::RuleSet;
 
     color_scheme = ColorSchemes.colorschemes[
         :diverging_rainbow_bgymr_45_85_c67_n256]
-    colors = [ColorSchemes.get(color_scheme, i, (1,rules.ntypes)) for i in 1:rules.ntypes]
+    colors = [ColorSchemes.get(color_scheme, i, (1,rules.ncelltypes)) for i in 1:rules.ncelltypes]
 
     scripts = String(read(joinpath(dirname(pathof(Cronenberg)), "draw.js")))
 
@@ -838,21 +895,23 @@ function run(world::World, rules::RuleSet;
         async=false)
 
     clear_world(blink_window[], pixelsize, "white")
-    draw_world(blink_window[], world, colors, rules.ntypes)
+    draw_world(blink_window[], world, colors, rules.ncelltypes)
     savestate!(world)
 
     E = loss(world, rules)
 
     ntiles = length(world.tiles)
-    nticks_per_mcs = round(Int, m*n/ntiles)
+    # nticks_per_mcs = round(Int, m*n/ntiles)
 
     step = 0
     for mcs in 1:nsteps
-        for _ in 1:nticks_per_mcs
-            E = tick(world, rules, E)
+        expected_proposals = 0.0
+        while expected_proposals < m*n
+            E, expected_proposals_k = tick(world, rules, E)
+            expected_proposals += expected_proposals_k
             step += 1
             if step % 500 == 0
-                redraw_world(blink_window[], world, colors, rules.ntypes)
+                redraw_world(blink_window[], world, colors, rules.ncelltypes)
 
                 savestate!(world)
                 @show (step, E)
