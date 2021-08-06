@@ -2,7 +2,10 @@ module Cronenberg
 
 import Blink
 import ColorSchemes
+using ArgParse
 using Colors: hex, LCHab, RGB
+using Images
+using Printf: @sprintf
 using Random: shuffle, shuffle!
 using StaticArrays
 
@@ -88,10 +91,11 @@ function RuleSet(ncelltypes::Int)
 
         # choose some celltypes disliked by i
         for j in candidates
+            # adhesion[i, j] = adhesion[j, i] = 1.0
             if rand() < 0.3
-                adhesion[i, j] = adhesion[j, i] = 5.0
+                adhesion[i, j] = adhesion[j, i] = 3.0
             elseif rand() < 0.1
-                adhesion[i, j] = adhesion[j, i] = -1.0
+                adhesion[i, j] = adhesion[j, i] = -1.5
             end
         end
     end
@@ -163,47 +167,46 @@ function World(rules::RuleSet, m::Int, n::Int, ncells::Int; nominal_tile_size::I
     volumes = zeros(Int32, ncells)
     areas = zeros(Int32, ncells)
 
-    # Uniform random initialization
-    coords = [(i,j) for i in 1:m, j in 1:n]
-    shuffle!(coords)
+    # # Uniform random initialization
+    # coords = [(i,j) for i in 1:m, j in 1:n]
+    # shuffle!(coords)
 
-    for k in 1:ncells
-        i, j = coords[k]
-        state[i, j] = k
-        types[k] = rand(1:rules.ncelltypes)
-        volumes[k] = 1
-        areas[k] = 1
-    end
+    # for k in 1:ncells
+    #     i, j = coords[k]
+    #     state[i, j] = k
+    #     types[k] = rand(1:rules.ncelltypes)
+    #     volumes[k] = 1
+    #     areas[k] = 1
+    # end
 
     # TODO: Maybe we could generate random splines and dump cells out around
     # that spline to reward formation of "sheets"
 
-    # # Clumpier initialization: choose random rectangles, choose a random
-    # # cell type, put some cells in there
-    # ncells_remaining = ncells
-    # max_cells_per_rect = 200
-    # while ncells_remaining > 0
-    #     h = rand(1:m)
-    #     w = rand(1:n)
-    #     i0 = rand(1:(m - h + 1))
-    #     j0 = rand(1:(n - w + 1))
-    #     i1 = i0 + h - 1
-    #     j1 = j0 + w - 1
+    # Clumpier initialization: choose random rectangles, choose a random
+    # cell type, put some cells in there
+    ncells_remaining = ncells
+    max_cells_per_rect = 200
+    while ncells_remaining > 0
+        h = rand(1:m)
+        w = rand(1:n)
+        i0 = rand(1:(m - h + 1))
+        j0 = rand(1:(n - w + 1))
+        i1 = i0 + h - 1
+        j1 = j0 + w - 1
 
-    #     type = rand(1:ncelltype)
-    #     nrectcells = min(ncells_remaining, rand(1:max_cells_per_rect))
-    #     @show nrectcells
+        type = rand(1:rules.ncelltypes)
+        nrectcells = min(ncells_remaining, rand(1:max_cells_per_rect))
 
-    #     for i in 1:nrectcells
-    #         i = rand(i0:i1)
-    #         j = rand(j0:j1)
-    #         state[i, j] = ncells_remaining
-    #         types[ncells_remaining] = type
-    #         volumes[ncells_remaining] = 1
-    #         areas[ncells_remaining] = 1
-    #         ncells_remaining -= 1
-    #     end
-    # end
+        for i in 1:nrectcells
+            i = rand(i0:i1)
+            j = rand(j0:j1)
+            state[i, j] = ncells_remaining
+            types[ncells_remaining] = type
+            volumes[ncells_remaining] = 1
+            areas[ncells_remaining] = 1
+            ncells_remaining -= 1
+        end
+    end
 
     # Build neighbors matrix
     neighbors = findneighbors(state)
@@ -215,8 +218,6 @@ function World(rules::RuleSet, m::Int, n::Int, ncells::Int; nominal_tile_size::I
     nxtiles = max(1, div(n, nominal_tile_size, RoundUp))
     ntiles = nxtiles * nytiles
     tiles = Matrix{Tile}(undef, 4, ntiles)
-
-    @show ntiles
 
     tile = 0
     for ytile in 1:nytiles, xtile in 1:nxtiles
@@ -630,6 +631,20 @@ end
 
 
 """
+Count the number of possible source pixels for monte carlo proposals in the
+given tile.
+"""
+function count_candidates(tile::Tile, neighbors::Matrix{UInt8})
+    yrange, xrange = tile
+    ncandidates_k = 0
+    @inbounds for i in yrange, j in xrange
+        ncandidates_k += neighbors[i, j] != 0
+    end
+    return ncandidates_k
+end
+
+
+"""
 Make a single proposal in every tile.
 """
 function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
@@ -643,12 +658,9 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
         # Compute the number of candidates in each tile
         fill!(world.ncandidates, 0)
         Threads.@threads for k in 1:size(world.tiles, 2)
-            yrange, xrange = world.tiles[quadrant, k]
-            ncandidates_k = 0
-            @inbounds for i in xrange, j in yrange
-                ncandidates_k += world.neighbors[i, j] != 0
-            end
-            world.ncandidates[k] = ncandidates_k
+        # for k in 1:size(world.tiles, 2)
+            world.ncandidates[k] = count_candidates(
+                world.tiles[quadrant, k], world.neighbors)
         end
 
         max_candidates = maximum(world.ncandidates)
@@ -658,6 +670,7 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
         end
 
         Threads.@threads for k in 1:size(world.tiles, 2)
+        # for k in 1:size(world.tiles, 2)
             # Randomly skip sparsely populated tiles
             if rand() > world.ncandidates[k] / max_candidates
                 continue
@@ -680,7 +693,7 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
 
             source_border_pos = rand(1:nborder_pixels)
             i_source, j_source = 0, 0
-            @inbounds for i in xrange, j in yrange
+            @inbounds for i in yrange, j in xrange
                 if world.neighbors[i, j] != 0
                     source_border_pos -= 1
                     if source_border_pos == 0
@@ -750,8 +763,6 @@ function tick(world::World, rules::RuleSet, E::Float32, T::Float64=1.0)
                     end
                 end
 
-                # TODO: I should maybe no accumulate act energies?
-
                 world.ΔEs[k] = ΔE
             else
                 world.ΔEs[k] = 0f0
@@ -814,11 +825,10 @@ function draw_act_world(win::Blink.Window, world::World, act_max::Int32)
 end
 
 
-
 """
 Draw the world from scratch.
 """
-function draw_world(win::Blink.Window, world::World, colors::Vector, ncelltypes::Int)
+function draw_world!(win::Blink.Window, world::World, colors::Vector, ncelltypes::Int)
     m, n = size(world)
     xs = Int[]
     ys = Int[]
@@ -843,8 +853,7 @@ function draw_world(win::Blink.Window, world::World, colors::Vector, ncelltypes:
     for type in 1:ncelltypes
         # draw border cells by darkening the color
         color = colors[type]
-        border_color = convert(LCHab, color)
-        border_color = LCHab(border_color.l - 30.0, border_color.c, border_color.h)
+        border_color = borderize_color(color)
 
         collect_and_draw(border_color, type, true)
         collect_and_draw(color, type, false )
@@ -852,7 +861,7 @@ function draw_world(win::Blink.Window, world::World, colors::Vector, ncelltypes:
 end
 
 
-function redraw_world(win::Blink.Window, world::World, colors::Vector, ncelltypes::Int)
+function redraw_world!(win::Blink.Window, world::World, colors::Vector, ncelltypes::Int)
     m, n = size(world)
     xs = Int[]
     ys = Int[]
@@ -881,8 +890,7 @@ function redraw_world(win::Blink.Window, world::World, colors::Vector, ncelltype
     for type in 0:ncelltypes
         if type > 0
             color = colors[type]
-            border_color = convert(LCHab, color)
-            border_color = LCHab(border_color.l - 30.0, border_color.c, border_color.h)
+            border_color = borderize_color(color)
         else
             border_color = color = RGB(1,1,1)
         end
@@ -893,56 +901,110 @@ function redraw_world(win::Blink.Window, world::World, colors::Vector, ncelltype
 end
 
 
-function run(world::World, rules::RuleSet;
-        nsteps::Int=10000, pixelsize::Int=3, wait_when_done::Bool=true)
-    m, n = size(world)
+function borderize_color(c::Colorant, Δl=-30)
+    c_lchab = convert(LCHab, c)
+    return LCHab(c_lchab.l - Δl, c_lchab.c, c_lchab.h)
+end
 
-    if blink_window[] === nothing || !Blink.active(blink_window[])
-        blink_window[] = Blink.Window()
+
+function draw_world!(img::Matrix{RGB24}, world::World, colors::Vector, ncelltypes::Int)
+    height, width = size(img)
+    m, n = size(world)
+    @assert height % m == 0
+    @assert width % n == 0
+    y_pixelsize = div(height, m)
+    x_pixelsize = div(width, n)
+
+    colors_rgb24 = RGB24[convert(RGB24, c) for c in colors]
+    border_colors_rgb24 = RGB24[convert(RGB24, borderize_color(c)) for c in colors]
+
+    fill!(img, RGB24(1,1,1))
+    Threads.@threads for i in 1:m
+        for j in 1:n
+            type = gettype(world, i, j)
+            if type != 0
+                yrange = ((i-1)*y_pixelsize+1):(i*y_pixelsize)
+                xrange = ((j-1)*x_pixelsize+1):(j*x_pixelsize)
+                if isborder(world.neighbors, i, j)
+                    img[yrange, xrange] .= border_colors_rgb24[type]
+                else
+                    img[yrange, xrange] .= colors_rgb24[type]
+                end
+            end
+        end
     end
+end
+
+
+function run(world::World, rules::RuleSet;
+        nsteps::Int=10000, pixelsize::Int=3, T::Float64=1.0,
+        output_dir::Union{Nothing, String}=nothing,
+        watch::Bool=true,
+        wait_when_done::Bool=true)
+    m, n = size(world)
 
     color_scheme = ColorSchemes.colorschemes[
         :diverging_rainbow_bgymr_45_85_c67_n256]
     colors = [ColorSchemes.get(color_scheme, i, (1,rules.ncelltypes)) for i in 1:rules.ncelltypes]
 
-    scripts = String(read(joinpath(dirname(pathof(Cronenberg)), "draw.js")))
+    if watch && (blink_window[] === nothing || !Blink.active(blink_window[]))
+        blink_window[] = Blink.Window()
+    end
 
-    Blink.body!(
-        blink_window[],
-        """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Cronenberg</title>
-            <script>$(scripts)</script>
-        </head>
-        <body>
-            <canvas id="canvas" width="$(pixelsize*n)" height="$(pixelsize*m)"></canvas>
-        </body>
-        </html>
-        """,
-        async=false)
+    if watch
+        scripts = String(read(joinpath(dirname(pathof(Cronenberg)), "draw.js")))
+        Blink.body!(
+            blink_window[],
+            """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Cronenberg</title>
+                <script>$(scripts)</script>
+            </head>
+            <body>
+                <canvas id="canvas" width="$(pixelsize*n)" height="$(pixelsize*m)"></canvas>
+            </body>
+            </html>
+            """,
+            async=false)
 
-    clear_world(blink_window[], pixelsize, "white")
-    draw_world(blink_window[], world, colors, rules.ncelltypes)
-    savestate!(world)
+        clear_world(blink_window[], pixelsize, "white")
+        draw_world!(blink_window[], world, colors, rules.ncelltypes)
+        savestate!(world)
+    end
 
     E = loss(world, rules)
 
     ntiles = length(world.tiles)
     # nticks_per_mcs = round(Int, m*n/ntiles)
 
+    img = Matrix{RGB24}(undef, (m*pixelsize, n*pixelsize))
+
     step = 0
+    imgnum = 0
+    mkpath("imgs")
+
     for mcs in 1:nsteps
         expected_proposals = 0.0
         while expected_proposals < m*n
-            E, expected_proposals_k = tick(world, rules, E)
+            E, expected_proposals_k = tick(world, rules, E, T)
             expected_proposals += expected_proposals_k
             step += 1
-            if step % 500 == 0
-                redraw_world(blink_window[], world, colors, rules.ncelltypes)
+            if step % 1000 == 0
+                imgnum += 1
 
-                savestate!(world)
+                if watch
+                    redraw_world!(blink_window[], world, colors, rules.ncelltypes)
+                    savestate!(world)
+                end
+
+                if output_dir !== nothing
+                    filename = joinpath(output_dir, @sprintf("frame-%09d.png", imgnum))
+                    draw_world!(img, world, colors, rules.ncelltypes)
+                    save(filename, img)
+                end
+
                 @show (step, E)
             end
         end
