@@ -4,7 +4,10 @@ import Blink
 import ColorSchemes
 using ArgParse
 using Colors: hex, LCHab, RGB
+using Distributions: Categorical
+using FileIO
 using Images
+using NearestNeighbors
 using Printf: @sprintf
 using Random: shuffle, shuffle!
 using StaticArrays
@@ -42,6 +45,9 @@ const NEIGHBORS_AND_SELF = SA[
 #     ( 0,  1),
 #     ( 1,  0),
 #     ( 0, -1) ]
+
+
+softmax(xs) = exp.(xs) ./ sum(exp.(xs))
 
 
 """
@@ -83,6 +89,7 @@ function RuleSet(ncelltypes::Int)
     rigidity_area = fill(0.05f0, ncelltypes)
 
     adhesion = zeros(Float32, (ncelltypes+1, ncelltypes+1))
+    adhesion = zeros(Float32, (ncelltypes+1, ncelltypes+1))
 
     for i in 2:ncelltypes+1
         # adhesion[i, i] = -2.0
@@ -101,9 +108,121 @@ function RuleSet(ncelltypes::Int)
     end
 
     self_adhesion = -2.0
-    act_max = 10
+    # act_max = 10
+    act_max = 5
 
-    return Cronenberg.RuleSet(
+    return RuleSet(
+      ncelltypes,
+      adhesion,
+      self_adhesion,
+      target_volume,
+      rigidity_volume,
+      target_area,
+      rigidity_area,
+      act_max)
+end
+
+
+"""
+Find the radius at which points have on average `avg_neighbors_target` neighbors.
+"""
+function calibrate_radius(kdtree::KDTree{A, B, T}, avg_neighbors_target::Int) where {A, B, T}
+
+    xmin = T(Inf)
+    xmax = T(-Inf)
+    ymin = T(Inf)
+    ymax = T(-Inf)
+
+    for pt in kdtree.data
+        xmin = min(xmin, pt[1])
+        xmax = max(xmax, pt[1])
+        ymin = min(ymin, pt[2])
+        ymax = max(ymax, pt[2])
+    end
+
+    max_radius = sqrt((xmax - xmin)^2 + (ymax - ymin)^2)
+    max_radius /= 4 # try to find a more reasonable starting place
+    eps = max_radius / T(1e6)
+    min_radius = eps
+
+    # binary search to find a good radius
+    println("calibrating neighborhood radius...")
+    while max_radius - min_radius > eps
+        avg_neighbors = 0
+        radius = (min_radius + max_radius) / 2
+        for pt in kdtree.data
+            avg_neighbors += length(inrange(kdtree, pt, radius, false))
+        end
+        avg_neighbors /= length(kdtree.data)
+
+        @show (min_radius, max_radius, avg_neighbors)
+
+        if avg_neighbors < avg_neighbors_target
+            min_radius = radius
+        else
+            max_radius = radius
+        end
+    end
+
+    radius = (min_radius + max_radius) / 2
+    println("radius: $(radius)")
+
+    return radius
+end
+
+
+"""
+Construct a rule set from a table file containing cell positions and types.
+"""
+function RuleSet(xs::Vector, ys::Vector, labels::Vector, avg_neighbors_target::Int=10;
+        adhesion_scale::Float32=1f0)
+
+    n = length(xs)
+    @assert length(ys) == n
+    @assert length(labels) == n
+
+    kdtree = KDTree(Float64.(transpose(hcat(xs, ys))), leafsize=10)
+    radius = calibrate_radius(kdtree, avg_neighbors_target)
+    @show radius
+
+    ncelltypes = maximum(labels)
+    affinity = zeros(Int, (ncelltypes, ncelltypes))
+
+    for i in 1:n
+        for j in inrange(kdtree, [xs[i], ys[i]], radius, false)
+            affinity[labels[i], labels[j]] += 1
+            affinity[labels[j], labels[i]] += 1
+        end
+    end
+
+    type_counts = zeros(Int, ncelltypes)
+    for label in labels
+        type_counts[label] += 1
+    end
+
+    nedges = sum(affinity)
+    type_proportions = type_counts / sum(type_counts)
+    expected_edge_proportions = type_proportions * transpose(type_proportions)
+
+    relative_log2_affinity = log2.(affinity ./ (expected_edge_proportions .* nedges))
+
+    adhesion = zeros(Float32, (ncelltypes+1, ncelltypes+1))
+    for i in 1:ncelltypes
+        for j in i+1:ncelltypes
+            adhesion[i+1, j+1] = adhesion[j+1, i+1] = -adhesion_scale * relative_log2_affinity[i, j]
+        end
+    end
+
+    self_adhesion = -2.0
+    act_max = 5
+
+    target_volume = Int32[rand(30:100) for _ in 1:ncelltypes]
+    rigidity_volume = fill(0.5f0, ncelltypes)
+
+    target_area = Int32[round(Int, π*sqrt(vol), RoundUp) for vol in target_volume]
+    rigidity_area = fill(0.05f0, ncelltypes)
+
+    return RuleSet(
       ncelltypes,
       adhesion,
       self_adhesion,
@@ -179,34 +298,57 @@ function World(rules::RuleSet, m::Int, n::Int, ncells::Int; nominal_tile_size::I
     #     areas[k] = 1
     # end
 
-    # TODO: Maybe we could generate random splines and dump cells out around
-    # that spline to reward formation of "sheets"
+    # Produce random layers of cells
+    coords = [(i,j) for i in 1:m, j in 1:n]
+    shuffle!(coords)
 
-    # Clumpier initialization: choose random rectangles, choose a random
-    # cell type, put some cells in there
-    ncells_remaining = ncells
-    max_cells_per_rect = 200
-    while ncells_remaining > 0
-        h = rand(1:m)
-        w = rand(1:n)
-        i0 = rand(1:(m - h + 1))
-        j0 = rand(1:(n - w + 1))
-        i1 = i0 + h - 1
-        j1 = j0 + w - 1
+    freqs = [(0.2 * m + rand() * 0.5 * m) for _ in 1:rules.ncelltypes] ./ (2*π)
+    offsets = [π*rand() for _ in 1:rules.ncelltypes]
 
-        type = rand(1:rules.ncelltypes)
-        nrectcells = min(ncells_remaining, rand(1:max_cells_per_rect))
-
-        for i in 1:nrectcells
-            i = rand(i0:i1)
-            j = rand(j0:j1)
-            state[i, j] = ncells_remaining
-            types[ncells_remaining] = type
-            volumes[ncells_remaining] = 1
-            areas[ncells_remaining] = 1
-            ncells_remaining -= 1
-        end
+    for k in 1:ncells
+        i, j = coords[k]
+        state[i, j] = k
+        type = rand(Categorical(softmax(sin.(offsets .+ i ./ freqs))))
+        types[k] = type
+        volumes[k] = 1
+        areas[k] = 1
     end
+
+    # # Clumpier initialization: choose random rectangles, choose a random
+    # # cell type, put some cells in there
+    # ncells_remaining = ncells
+    # max_cells_per_rect = 200
+    # while ncells_remaining > 0
+    #     h = rand(1:m)
+    #     w = rand(1:n)
+    #     i0 = rand(1:(m - h + 1))
+    #     j0 = rand(1:(n - w + 1))
+    #     i1 = i0 + h - 1
+    #     j1 = j0 + w - 1
+
+    #     type = rand(1:rules.ncelltypes)
+    #     nrectcells = min(ncells_remaining, rand(1:max_cells_per_rect))
+
+    #     for i in 1:nrectcells
+    #         i = rand(i0:i1)
+    #         j = rand(j0:j1)
+    #         state[i, j] = ncells_remaining
+    #         types[ncells_remaining] = type
+    #         volumes[ncells_remaining] = 1
+    #         areas[ncells_remaining] = 1
+    #         ncells_remaining -= 1
+    #     end
+    # end
+
+    return World(state, types, volumes, areas, nominal_tile_size=nominal_tile_size)
+end
+
+function World(
+        state::Matrix{Int32}, types::Vector{Int32},
+        volumes::Vector{Int32}, areas::Vector{Int32};
+        nominal_tile_size::Int=40)
+
+    m, n = size(state)
 
     # Build neighbors matrix
     neighbors = findneighbors(state)
@@ -249,6 +391,36 @@ function World(rules::RuleSet, m::Int, n::Int, ncells::Int; nominal_tile_size::I
     return World(
         state, similar(state), neighbors, similar(neighbors),
         act, tiles, ncandidates, types, volumes, areas, visited, ΔEs)
+end
+
+
+"""
+Initialize a world from csv file containing cell positions and types.
+"""
+function World(xs::Vector, ys::Vector, labels::Vector; nominal_tile_size::Int=40)
+    ncelltypes = maximum(labels)
+    ncells = length(labels)
+
+    # TODO: We don't know the scale of xs, ys. Maybe avoid just rounding to integers?
+    # Furthermore, even without scaling, we may have two cells in the same location.
+
+    m = round(Int, maximum(ys), RoundUp)
+    n = round(Int, maximum(xs), RoundUp)
+
+    state = zeros(Int32, (m, n))
+    types = zeros(Int32, ncells)
+    volumes = zeros(Int32, ncells)
+    areas = zeros(Int32, ncells)
+    for k in 1:ncells
+        i = max(1, round(Int, ys[k]))
+        j = max(1, round(Int, xs[k]))
+        state[i, j] = k
+        types[k] = labels[k]
+        volumes[k] = 1
+        areas[k] = 1
+    end
+
+    return World(state, types, volumes, areas, nominal_tile_size=nominal_tile_size)
 end
 
 
@@ -1002,7 +1174,9 @@ function run(world::World, rules::RuleSet;
                 if output_dir !== nothing
                     filename = joinpath(output_dir, @sprintf("frame-%09d.png", imgnum))
                     draw_world!(img, world, colors, rules.ncelltypes)
-                    save(filename, img)
+                    open(filename, "w") do output
+                        save(Images.Stream{format"PNG"}(output), img)
+                    end
                 end
 
                 @show (step, E)
