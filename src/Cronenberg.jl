@@ -4,13 +4,106 @@ import Blink
 import ColorSchemes
 using ArgParse
 using Colors: hex, LCHab, RGB
-using Distributions: Categorical
+using DataFrames
+using Distributions: Categorical, MvNormal
 using FileIO
+using HDF5
 using Images
 using NearestNeighbors
 using Printf: @sprintf
-using Random: shuffle, shuffle!
+using ProgressMeter
+using PyCall
+using Random: shuffle, shuffle!, seed!
 using StaticArrays
+using Statistics
+
+
+# const cvae_py = PyNULL()
+# const anndata_py = PyNULL()
+# function __init__()
+#     python_path = PyVector(getproperty(pyimport("sys"), "path"))
+#     pushfirst!(python_path, joinpath(dirname(pathof(Cronenberg))))
+#     copy!(cvae_py, pyimport("cvae"))
+#     copy!(anndata_py, pyimport("anndata"))
+# end
+
+# include("cvae.jl")
+
+include("cgan.jl")
+
+
+function fit_expression_model(
+        input_h5ad_filename::String,
+        output_params_filename::String)
+
+    adata = read(input_h5ad_filename, AnnData)
+    labels = adata.obs.label .+ 1
+    X = adata.X
+    ncelltypes = maximum(labels)
+    ngenes, ncells = size(X)
+
+    μs = zeros(Float32, (ngenes, ncelltypes))
+    ns = zeros(Int, (1, ncelltypes))
+
+    for (i, label) in enumerate(labels)
+        μs[:,label] .+= X[:,i]
+        ns[1, label] += 1
+    end
+    μs ./= ns
+
+    σs = zeros(Float32, (ngenes, ncelltypes))
+    for (i, label) in enumerate(labels)
+        σs[:,label] = (X[:,i] .- μs[:,label]).^2
+    end
+    σs ./= ns
+    σs = sqrt.(σs)
+
+    h5open(output_params_filename, "w") do output
+        output["μ"] = μs
+        output["σ"] = σs
+    end
+end
+
+
+function sample_expression_model(
+        input_params_filename::String,
+        input_h5ad_filename::String,
+        output_h5ad_filename::String)
+    params = h5open(input_params_filename)
+    μs = read(params["μ"])
+    σs = read(params["σ"])
+    close(params)
+
+    @assert size(μs) == size(σs)
+    ngenes, ncelltypes = size(μs)
+
+    adata = read(input_h5ad_filename, AnnData)
+    labels = adata.obs.label .+ 1
+    ncells = size(adata.X, 2)
+
+    X = Array{Float32}(undef, (ngenes, ncells))
+    for (i, label) in enumerate(labels)
+        X[:,i] = rand(MvNormal(μs[:,label], σs[:,label]))
+    end
+
+    var = DataFrame(
+        "_index" => String[string(i-1) for i in 1:ngenes])
+
+    adata = AnnData(
+        X,
+        adata.obsm,
+        adata.obsp,
+        adata.uns,
+        adata.obs,
+        var)
+
+    write(output_h5ad_filename, adata)
+end
+
+
+include("anndatas.jl")
+using .AnnDatas
+
 
 const Tile = Tuple{UnitRange{Int}, UnitRange{Int}}
 
@@ -175,7 +268,9 @@ end
 Construct a rule set from a table file containing cell positions and types.
 """
 function RuleSet(xs::Vector, ys::Vector, labels::Vector, avg_neighbors_target::Int=10;
-        adhesion_scale::Float32=1f0)
+        neg_self_adhesion=2.0, adhesion_scale=1.0, act_max=3)
+
+    self_adhesion = -neg_self_adhesion
 
     n = length(xs)
     @assert length(ys) == n
@@ -213,11 +308,8 @@ function RuleSet(xs::Vector, ys::Vector, labels::Vector, avg_neighbors_target::I
         end
     end
 
-    self_adhesion = -2.0
-    act_max = 5
-
     target_volume = Int32[rand(30:100) for _ in 1:ncelltypes]
-    rigidity_volume = fill(0.5f0, ncelltypes)
+    rigidity_volume = fill(0.3f0, ncelltypes)
 
     target_area = Int32[round(Int, π*sqrt(vol), RoundUp) for vol in target_volume]
     rigidity_area = fill(0.05f0, ncelltypes)
@@ -231,6 +323,29 @@ function RuleSet(xs::Vector, ys::Vector, labels::Vector, avg_neighbors_target::I
       target_area,
       rigidity_area,
       act_max)
+end
+
+
+function Base.write(filename::String, ruleset::RuleSet)
+    h5open(filename, "w") do output
+        for name in fieldnames(RuleSet)
+            output[String(name)] = getfield(ruleset, name)
+        end
+    end
+end
+
+
+function Base.read(filename::String, ::Type{RuleSet})
+    input = h5open(filename)
+    return RuleSet(
+        read(input["ncelltypes"]),
+        read(input["adhesion"]),
+        read(input["self_adhesion"]),
+        read(input["target_volume"]),
+        read(input["rigidity_volume"]),
+        read(input["target_area"]),
+        read(input["rigidity_area"]),
+        read(input["act_max"]))
 end
 
 
@@ -425,6 +540,74 @@ end
 
 
 """
+Compute a the mean pixel position for each cell.
+"""
+function cell_centers(world::World)
+    ncells = length(world.types)
+    m, n = size(world)
+
+    xs = zeros(Float32, ncells)
+    ys = zeros(Float32, ncells)
+
+    for i in 1:m, j in 1:n
+        cell = world.state[i, j]
+        if cell != 0
+            xs[cell] += j
+            ys[cell] += i
+        end
+    end
+
+    xs ./= world.volumes
+    ys ./= world.volumes
+
+    return (xs, ys)
+end
+
+
+"""
+Write a csv file with cell positions and types.
+"""
+function write_types(filename::String, world::World)
+    xs, ys = cell_centers(world)
+    open(filename, "w") do ouptut
+        println(output, "x,y,label")
+        for (x, y, label) in zip(xs, ys, world.types[2:end])
+            println(output, x, ',', y, ',', label)
+        end
+    end
+end
+
+
+"""
+Write cell positions to a hd5ad file.
+"""
+function write_positions(filename::String, world::World)
+
+    xs, ys = cell_centers(world)
+    ncells = length(xs)
+
+    adata = AnnData(
+        zeros(Float32, (0, ncells)),
+        Dict{String,Any}(
+            "spatial" => Matrix(transpose(hcat(xs, ys)))),
+        nothing,
+        nothing,
+        DataFrame("label" => world.types .- 1),
+        nothing)
+
+    write(filename, adata)
+
+    # h5open(filename, "w") do output
+    #     output["X"] = zeros(Float32, (0, ncells))
+    #     obsm = create_group(output, "obsm")
+    #     obsm["spatial"] = Matrix(transpose(hcat(xs, ys)))
+    #     obs = write_dataframe(output, "obs", ncells, ["label" => world.types .- 1])
+    #     var = write_dataframe(output, "var", 0, [])
+    # end
+end
+
+
+"""
 Store the current (world.state, world.neighbors) in (world.prev_state, world.prev_neighbors)
 """
 function savestate!(world::World)
@@ -511,7 +694,7 @@ Geometric mean act value in a moore neighborhood.
 function gmact(world::World, i::Int, j::Int)
     m, n = size(world)
     state = getstate(world, i, j)
-    gm = Int32(1)
+    gm = Int64(1)
     neighborhood_size = 0
 
     for (i_off, j_off) in NEIGHBORS_AND_SELF
@@ -519,12 +702,32 @@ function gmact(world::World, i::Int, j::Int)
         if getstate(world, i_neighbor, j_neighbor) == state
             neighborhood_size += 1
             if 1 <= i_neighbor <= m && 1 <= j_neighbor <= n
-                gm *= world.act[i_neighbor, j_neighbor]
+                gm *= Int64(world.act[i_neighbor, j_neighbor])
             end
         end
     end
 
-    return Float32(gm)^(1/neighborhood_size)
+    return Float32(Float64(gm)^Float64(1/neighborhood_size))
+
+    # try
+    #     return neighborhood_size == 0 ?
+    #         0f0 : Float32(Float64(gm)^Float64(1/neighborhood_size))
+    # catch
+    #     @show gm
+    #     @show neighborhood_size
+
+    #     for (i_off, j_off) in NEIGHBORS_AND_SELF
+    #         i_neighbor, j_neighbor = i + i_off, j + j_off
+    #         if getstate(world, i_neighbor, j_neighbor) == state
+    #             neighborhood_size += 1
+    #             if 1 <= i_neighbor <= m && 1 <= j_neighbor <= n
+    #                 @show (i_neighbor, j_neighbor, world.act[i_neighbor, j_neighbor])
+    #             end
+    #         end
+    #     end
+
+    #     rethrow()
+    # end
 end
 
 
@@ -1108,7 +1311,71 @@ function draw_world!(img::Matrix{RGB24}, world::World, colors::Vector, ncelltype
 end
 
 
-function run(world::World, rules::RuleSet;
+"""
+"Train" a cellular potts model. I.e. set rules to be vaguely informed by an
+existing labeled dataset.
+"""
+function fit_cell_model(
+    input_h5ad_filename::String, output_params_filename::String)
+
+    adata = read(input_h5ad_filename, AnnData)
+    xs = adata.obsm["spatial"][1,:]
+    ys = adata.obsm["spatial"][2,:]
+    labels = adata.obs[!, "label"] .+ 1
+
+    @show length(xs)
+    @show length(ys)
+    @show length(labels)
+
+    ruleset = RuleSet(xs, ys, labels)
+
+    write(output_params_filename, ruleset)
+end
+
+
+"""
+Sample from the cell model and write to a new h5ad file.
+"""
+function sample_cell_model(
+        input_params_filename::String, output_h5ad_filename::String,
+        nsteps=5000, T::Float64=1.0, m=1000, n=1000, ncells=10000)
+
+    # TODO: should the initialization also be fit the training dataset somehow?
+
+    ruleset = read(input_params_filename, RuleSet)
+
+    world = World(ruleset, m, n, ncells)
+
+    E = loss(world, ruleset)
+    step = 0
+
+    prog = Progress(nsteps, 0.5, "Simulating cells ", 60)
+    for mcs in 1:nsteps
+        expected_proposals = 0.0
+
+        nborderpixels = 0
+        for neighbors in world.neighbors
+            nborderpixels += count_ones(neighbors) > 0
+        end
+
+        while expected_proposals < nborderpixels
+            E, expected_proposals_k = tick(world, ruleset, E, T)
+            expected_proposals += expected_proposals_k
+            step += 1
+            # if step % 1000 == 0
+            #     @show (step, E, mean(world.act), nborderpixels)
+            # end
+        end
+        decayact!(world)
+        next!(prog)
+    end
+    finish!(prog)
+
+    write_positions(output_h5ad_filename, world)
+end
+
+
+function run!(world::World, rules::RuleSet;
         nsteps::Int=10000, pixelsize::Int=3, T::Float64=1.0,
         output_dir::Union{Nothing, String}=nothing,
         watch::Bool=true,
@@ -1155,11 +1422,22 @@ function run(world::World, rules::RuleSet;
 
     step = 0
     imgnum = 0
-    mkpath("imgs")
+
+    if output_dir !== nothing
+        mkpath(output_dir)
+    end
 
     for mcs in 1:nsteps
+        @show mcs
         expected_proposals = 0.0
-        while expected_proposals < m*n
+
+        nborderpixels = 0
+        for neighbors in world.neighbors
+            nborderpixels += count_ones(neighbors) > 0
+        end
+
+        while expected_proposals < nborderpixels
+        # while expected_proposals < m*n
             E, expected_proposals_k = tick(world, rules, E, T)
             expected_proposals += expected_proposals_k
             step += 1
@@ -1179,7 +1457,7 @@ function run(world::World, rules::RuleSet;
                     end
                 end
 
-                @show (step, E)
+                @show (step, E, mean(world.act), nborderpixels)
             end
         end
         decayact!(world)
@@ -1191,10 +1469,7 @@ function run(world::World, rules::RuleSet;
             yield()
         end
     end
-
-    # TODO: What I really want is an interface to advance the simulation,
-    # and some kind of thing to save it.
 end
 
 
-end # module
+end

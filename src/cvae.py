@@ -251,7 +251,7 @@ def sample_cvae(
     key = jax.random.PRNGKey(seed)
     X, μ, logσ2 = CVAE(z_dim=z_dim, expr_dim=ngenes, training=False).apply(vars, key, G)
 
-    adat = anndata.AnnData(
+    adata = anndata.AnnData(
         X=np.array(X, dtype=np.float32),
         obs=adata.obs,
         obsm=adata.obsm)
