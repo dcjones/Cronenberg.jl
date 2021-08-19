@@ -7,8 +7,7 @@ import TiffImages
 import Zygote
 using Flux
 using Flux.Losses: logitbinarycrossentropy, mae
-using Flux.Optimise: ADAM
-using StaticArrays
+using Flux.Optimise: update!
 
 const device = gpu
 # const device = cpu
@@ -471,15 +470,15 @@ function discriminator_loss(real_disc, fake_disc)
 end
 
 struct Generator
-    downsample_layers::SVector{8, Chain}
-    upsample_layers::SVector{7, Chain}
+    downsample_layers
+    upsample_layers
     output_layer::ConvTranspose
 end
 
 
 function Generator(maskdepth::Int, imgdepth::Int)
     # Input assumed to be [256, 256, indepth, B]
-    downsample_layers = SA[
+    downsample_layers = [
         downsample(4, maskdepth, 64, batchnorm=false), # [128, 128, 64, B]
         downsample(4, 64, 128),  # [64, 64, 128, B]
         downsample(4, 128, 256), # [32, 32, 256, B]
@@ -491,7 +490,7 @@ function Generator(maskdepth::Int, imgdepth::Int)
     ] .|> device
 
     # Note, input depths are doubled due to skip connections
-    upsample_layers = SA[
+    upsample_layers = [
         upsample(4, 512, 512, dropout=true), # [2, 2, 512, B]
         upsample(4, 1024, 512, dropout=true), # [4, 4, 512, B]
         upsample(4, 1024, 512, dropout=true), # [8, 8, 512, B]
@@ -515,35 +514,31 @@ end
 
 
 function (gen::Generator)(masks::AbstractArray)
-    # Downsample
-    input = masks
-    skips = Any[]
-    for lyr in gen.downsample_layers
-        input = lyr(input)
-        push!(skips, input)
-    end
+    down128 = gen.downsample_layers[1](masks)
+    down64  = gen.downsample_layers[2](down128)
+    down32  = gen.downsample_layers[3](down64)
+    down16  = gen.downsample_layers[4](down32)
+    down8   = gen.downsample_layers[5](down16)
+    down4   = gen.downsample_layers[6](down8)
+    down2   = gen.downsample_layers[7](down4)
+    down1   = gen.downsample_layers[8](down2)
 
-    pop!(skips)
-    reverse!(skips)
+    up2   = gen.upsample_layers[1](down1)
+    up4   = gen.upsample_layers[2](cat(up2, down2, dims=3))
+    up8   = gen.upsample_layers[3](cat(up4, down4, dims=3))
+    up16  = gen.upsample_layers[4](cat(up8, down8, dims=3))
+    up32  = gen.upsample_layers[5](cat(up16, down16, dims=3))
+    up64  = gen.upsample_layers[6](cat(up32, down32, dims=3))
+    up128 = gen.upsample_layers[7](cat(up64, down64, dims=3))
 
-    @show size(input)
-
-    # Upsample
-    for (lyr, skip) in zip(gen.upsample_layers, skips)
-        input = lyr(input)
-        @show (typeof(input), typeof(skip))
-        @show (size(input), size(skip))
-        input = cat(input, skip, dims=3)
-    end
-
-    return gen.output_layer(input)
+    return gen.output_layer(cat(up128, down128, dims=3))
 end
 
 
 function generator_loss(
         real_imgs::AbstractArray, fake_imgs::AbstractArray,
         fake_disc::AbstractArray, λ::Float32)
-    gan_loss = binarycrossentropy(fake_disc, 1f0)
+    gan_loss = logitbinarycrossentropy(fake_disc, 1f0)
     l1_loss = mae(real_imgs, fake_imgs)
 
     return gan_loss + (λ * l1_loss)
@@ -577,10 +572,11 @@ function train_step(
         λ::Float32=100f0)
 
     ps = params(gen.downsample_layers, gen.upsample_layers, gen.output_layer)
+    loss = Dict()
     loss["gen"], back = Zygote.pullback(ps) do
         fake_imgs = gen(masks)
         loss["disc"] = train_discriminator(disc_opt, disc, masks, real_imgs, fake_imgs)
-        generator_loss(real_imgs, fake_imgs, disc(masks, fake_imgs), λ)
+        return generator_loss(real_imgs, fake_imgs, disc(masks, fake_imgs), λ)
     end
     grads = back(1f0)
     update!(gen_opt, ps, grads)
@@ -595,7 +591,7 @@ parameters to another hdf5 file.
 function train_cgan(
         training_data_filename::String;
         nepochs::Int=100,
-        batchsize::Int=100,
+        batchsize::Int=10,
         λ::Float32=100f0)
 
     trainingdata, maskdepth, imgdepth = read_training_data(
@@ -605,11 +601,11 @@ function train_cgan(
     disc = Discriminator(maskdepth, imgdepth)
 
     # Make sure I can run these
-    (masks, real_imgs) = first(trainingdata)
-    @show (maskdepth, imgdepth)
-    @show size(masks)
-    @show size(gen(masks |> device))
-    exit()
+    # (masks, real_imgs) = first(trainingdata)
+    # @show (maskdepth, imgdepth)
+    # @show size(masks)
+    # @show size(gen(masks |> device))
+    # exit()
 
     gen_opt = ADAM()
     disc_opt = ADAM()
