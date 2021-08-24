@@ -3,6 +3,7 @@
 using Colors
 import ColorSchemes
 import CSV
+import CUDA
 import JSON
 import LightXML
 import MultivariateStats
@@ -302,6 +303,7 @@ function make_cgan_cell_training_examples(
     channel_names = nothing
 
     count = 0
+    skip_count = 0
     for (cells_filename, imgs_filename) in cells_imgs_filenames
         if count > max_images
             break
@@ -352,16 +354,24 @@ function make_cgan_cell_training_examples(
             xmin, xmax = extrema([x for (x, y) in poly])
             ymin, ymax = extrema([y for (x, y) in poly])
 
-            @assert xmax - xmin + 1 <= ex_width
-            @assert ymax - ymin + 1 <= ex_height
+            if xmax - xmin + 4 > ex_width || ymax - ymin + 4 > ex_height
+                skip_count += 1
+                continue
+            end
 
-            xoff = round(Int, xmin - (ex_width - (xmax - xmin))/2 - 1)
-            yoff = round(Int, ymin - (ex_height - (ymax - ymin))/2 - 1)
+            # xoff = round(Int, xmin - (ex_width - (xmax - xmin))/2) - 1
+            # yoff = round(Int, ymin - (ex_height - (ymax - ymin))/2) - 1
 
-            offset_polygon = [(x-xoff, y-yoff) for (x,y) in poly]
+            # xoff = round(Int, xmin - 1)
+            # yoff = round(Int, ymin - 1)
+
+            xoff = round(Int, xmin - 1) - round(Int, (ex_width - (xmax - xmin))/2)
+            yoff = round(Int, ymin - 1) - round(Int, (ex_height - (ymax - ymin))/2)
+
+            offset_poly = [(x-xoff, y-yoff) for (x,y) in poly]
 
             cell_mask = zeros(Float32, (ex_height, ex_width, ncelltypes))
-            draw_polygon!(cell_mask, offset_polygon, label)
+            draw_polygon!(cell_mask, offset_poly, label)
 
             cell_img = zeros(Float32, (ex_height, ex_width, nchannels))
             copy_polygon!(cell_img, img, poly, xoff, yoff)
@@ -369,6 +379,8 @@ function make_cgan_cell_training_examples(
             push!(training_examples, (cell_img, cell_mask))
         end
     end
+
+    println("Skipped $(skip_count) cells that were too big.")
 
     if isempty(training_examples)
         error("No training examples. Possibly the input images are too sparsely populated.")
@@ -387,6 +399,22 @@ end
 
 
 """
+Same as cat(imgs..., dims=4), but doesn't stack overflow with too many images.
+"""
+function cat_images(imgs::Vector{Array{Float32, 3}})
+    h, w, d = size(imgs[1])
+    n = length(imgs)
+    catimg = Array{Float32}(undef, (h, w, d, n))
+
+    for (l, img) in enumerate(imgs)
+        catimg[:,:,:,l] .= img
+    end
+
+    return catimg
+end
+
+
+"""
 Dump training examples to one big hdf5 file.
 """
 function write_training_examples_hdf5(
@@ -397,24 +425,12 @@ function write_training_examples_hdf5(
     n = length(training_exampes)
     output = h5open(filename, "w")
 
-    imgs = cat([img for (img, mask) in training_exampes]..., dims=4)
-    masks = cat([mask for (img, mask) in training_exampes]..., dims=4)
+    imgs = cat_images([img for (img, mask) in training_exampes])
+    masks = cat_images([mask for (img, mask) in training_exampes])
 
     output["imgs"] = imgs
     output["masks"] = masks
     output["channel_names"] = channel_names
-
-    # Or we could write each to a seperate dataset, which might save memory
-    # but will be less convenient.
-
-    # img_group = create_group(output, "img")
-    # mask_group = create_group(output, "mask")
-
-    # for (i, (img, mask))  in enumerate(training_exampes)
-    #     key = @sprintf("%09d", i)
-    #     img_group[key] = img
-    #     mask_group[key] = mask
-    # end
 
     close(output)
 end
@@ -601,7 +617,7 @@ function read_training_data(training_data_filename::String, batchsize::Int)
     # normalize!(masks)
     # normalize!(imgs)
 
-    trainingdata = Flux.Data.DataLoader((masks, imgs), batchsize=batchsize)
+    trainingdata = Flux.Data.DataLoader((masks, imgs), batchsize=batchsize, shuffle=true)
 
     close(input)
 
@@ -659,14 +675,54 @@ function upsample(filters::Int, indepth::Int, outdepth::Int; dropout=false)
 end
 
 
-struct Discriminator
+abstract type Discriminator end
+
+
+struct Discriminator64 <: Discriminator
+    layers
+end
+
+
+function Flux.params(disc::Discriminator64)
+    return params(disc.layers)
+end
+
+
+function Discriminator64(maskdepth::Int, imgdepth::Int)
+    layers = Chain(
+        downsample(4, maskdepth+imgdepth, 64, batchnorm=false), # [32, 32, 64, B]
+        downsample(4, 64, 128), # [16, 16, 128, B]
+        downsample(4, 128, 256), # [16, 16, 128, B]
+        Flux.flatten,
+        Dense(8*8*256, 1)) |> device
+
+    # TODO: Just testing
+    # layers = Chain(
+    #     downsample(4, maskdepth+imgdepth, 64, batchnorm=false), # [32, 32, 64, B]
+    #     Flux.flatten,
+    #     Dense(32*32*64, 1)) |> device
+
+    return Discriminator64(layers)
+end
+
+
+function (disc::Discriminator64)(mask::AbstractArray, img::AbstractArray)
+    return disc.layers(cat(mask, img, dims=3))
+end
+
+struct PatchDiscriminator256 <: Discriminator
     downsample_block
     patch_block
     output_layer
 end
 
 
-function Discriminator(maskdepth::Int, imgdepth::Int)
+function Flux.params(disc::PatchDiscriminator256)
+    return params(disc.downsample_block, disc.patch_block, disc.output_layer)
+end
+
+
+function PatchDiscriminator256(maskdepth::Int, imgdepth::Int)
     # mask and image are concatenated to get an input of [256, 256, maskdepth+imgdepth, B]
     downsample_block = Chain(
         downsample(4, maskdepth+imgdepth, 64, batchnorm=false), # [128, 128, 64, B]
@@ -691,11 +747,11 @@ function Discriminator(maskdepth::Int, imgdepth::Int)
         (4, 4), 512 => 1,  stride=1,
         init=(dims...) -> 0.02f0 .* randn(Float32, dims...)) |> device # [30, 30, 1, B]
 
-    return Discriminator(downsample_block, patch_block, output_layer)
+    return PatchDiscriminator256(downsample_block, patch_block, output_layer)
 end
 
 
-function (disc::Discriminator)(mask::AbstractArray, img::AbstractArray)
+function (disc::PatchDiscriminator256)(mask::AbstractArray, img::AbstractArray)
     input = cat(mask, img, dims=3)
     input = disc.downsample_block(input) # [32, 32, 512, B]
     input = pad_zeros(input, (1, 1, 1, 1, 0, 0, 0, 0)) # [34, 34, 512, B]
@@ -711,14 +767,87 @@ function discriminator_loss(real_disc, fake_disc)
     return real_loss + fake_loss
 end
 
-struct Generator
+
+abstract type Generator end
+
+struct Generator64 <: Generator
     downsample_layers
     upsample_layers
     output_layer::ConvTranspose
 end
 
 
-function Generator(maskdepth::Int, imgdepth::Int)
+function Flux.params(gen::Generator64)
+    return params(gen.downsample_layers, gen.upsample_layers, gen.output_layer)
+end
+
+
+function Generator64(maskdepth::Int, imgdepth::Int)
+    # Input assumed to be [64, 64, indepth, B]
+    downsample_layers = [
+        downsample(4, maskdepth, 256, batchnorm=false), # [32, 32, 256, B]
+        downsample(4, 256, 512), # [16, 16, 512, B]
+        downsample(4, 512, 512), # [8, 8, 512, B]
+        downsample(4, 512, 512), # [4, 4, 512, B]
+        downsample(4, 512, 512), # [2, 2, 512, B]
+        downsample(4, 512, 512) # [1, 1, 512, B]
+    ] .|> device
+
+    # Note, input depths are doubled due to skip connections
+    upsample_layers = [
+        upsample(4, 512, 512, dropout=true), # [2, 2, 512, B]
+        upsample(4, 1024, 512, dropout=true), # [4, 4, 512, B]
+        upsample(4, 1024, 512, dropout=true), # [8, 8, 512, B]
+        upsample(4, 1024, 512), # [16, 16, 512, B]
+        upsample(4, 1024, 256), # [32, 32, 256, B]
+    ] .|> device
+
+    output_lyr = ConvTranspose(
+        (4, 4),
+        512 => imgdepth,
+        tanh,
+        stride=2,
+        pad=SamePad(),
+        init=(dims...) -> 0.02f0 .* randn(Float32, dims...)) |> device
+
+    return Generator64(
+        downsample_layers, upsample_layers, output_lyr)
+end
+
+
+function (gen::Generator64)(masks::AbstractArray)
+    down32 = gen.downsample_layers[1](masks)
+    down16  = gen.downsample_layers[2](down32)
+    down8  = gen.downsample_layers[3](down16)
+    down4  = gen.downsample_layers[4](down8)
+    down2   = gen.downsample_layers[5](down4)
+    down1   = gen.downsample_layers[6](down2)
+
+    up2   = gen.upsample_layers[1](down1)
+    up4   = gen.upsample_layers[2](cat(up2, down2, dims=3))
+    up8   = gen.upsample_layers[3](cat(up4, down4, dims=3))
+    up16  = gen.upsample_layers[4](cat(up8, down8, dims=3))
+    up32  = gen.upsample_layers[5](cat(up16, down16, dims=3))
+
+    out =  gen.output_layer(cat(up32, down32, dims=3))
+
+    return out
+end
+
+
+struct Generator256 <: Generator
+    downsample_layers
+    upsample_layers
+    output_layer::ConvTranspose
+end
+
+
+function Flux.params(gen::Generator256)
+    return params(gen.downsample_layers, gen.upsample_layers, gen.output_layer)
+end
+
+
+function Generator256(maskdepth::Int, imgdepth::Int)
     # Input assumed to be [256, 256, indepth, B]
     downsample_layers = [
         downsample(4, maskdepth, 64, batchnorm=false), # [128, 128, 64, B]
@@ -750,58 +879,30 @@ function Generator(maskdepth::Int, imgdepth::Int)
         pad=SamePad(),
         init=(dims...) -> 0.02f0 .* randn(Float32, dims...)) |> device
 
-    return Generator(
+    return Generator256(
         downsample_layers, upsample_layers, output_lyr)
 end
 
 
-function (gen::Generator)(masks::AbstractArray)
-    # @show extrema(masks)
+function (gen::Generator256)(masks::AbstractArray)
     down128 = gen.downsample_layers[1](masks)
-    # @show extrema(down128)
     down64  = gen.downsample_layers[2](down128)
-    # @show extrema(down64)
     down32  = gen.downsample_layers[3](down64)
-    # @show extrema(down32)
     down16  = gen.downsample_layers[4](down32)
-    # @show extrema(down16)
     down8   = gen.downsample_layers[5](down16)
-    # @show extrema(down8)
     down4   = gen.downsample_layers[6](down8)
-    # @show extrema(down4)
     down2   = gen.downsample_layers[7](down4)
-    # @show extrema(down2)
-    # @show gen.downsample_layers[8].layers[2].μ
-    # @show gen.downsample_layers[8].layers[2].σ²
     down1   = gen.downsample_layers[8](down2)
-    # @show gen.downsample_layers[8].layers[2].μ
-    # @show gen.downsample_layers[8].layers[2].σ²
-    # @show extrema(down1)
-
-    # TODO: Seems like everything goes to zero on this last downsample step.
-    # WTF? Why is that?
-
-    # TODO: It seems like the batchnorm sends it to zero somehow...
-    # Why would that be? Considering we have a batch size of 1,
-    # how else is it supposed to work?
 
     up2   = gen.upsample_layers[1](down1)
-    # @show extrema(up2)
     up4   = gen.upsample_layers[2](cat(up2, down2, dims=3))
-    # @show extrema(up4)
     up8   = gen.upsample_layers[3](cat(up4, down4, dims=3))
-    # @show extrema(up8)
     up16  = gen.upsample_layers[4](cat(up8, down8, dims=3))
-    # @show extrema(up16)
     up32  = gen.upsample_layers[5](cat(up16, down16, dims=3))
-    # @show extrema(up32)
     up64  = gen.upsample_layers[6](cat(up32, down32, dims=3))
-    # @show extrema(up64)
     up128 = gen.upsample_layers[7](cat(up64, down64, dims=3))
-    # @show extrema(up128)
 
     out =  gen.output_layer(cat(up128, down128, dims=3))
-    # @show extrema(out)
 
     return out
 end
@@ -820,7 +921,7 @@ end
 function train_discriminator(
         disc_opt, disc::Discriminator,
         masks::AbstractArray, real_imgs::AbstractArray, fake_imgs::AbstractArray)
-    ps = params(disc.downsample_block, disc.patch_block, disc.output_layer)
+    ps = params(disc)
     loss, back = Zygote.pullback(ps) do
         real_disc = disc(masks, real_imgs)
         fake_disc = disc(masks, fake_imgs)
@@ -843,7 +944,7 @@ function train_step(
         masks::AbstractArray, real_imgs::AbstractArray;
         λ::Float32=100f0)
 
-    ps = params(gen.downsample_layers, gen.upsample_layers, gen.output_layer)
+    ps = params(gen)
     loss = Dict()
     loss["gen"], back = Zygote.pullback(ps) do
         fake_imgs = gen(masks)
@@ -868,17 +969,18 @@ function gen_and_write_examples(
     for (masks, real_imgs) in trainingdata
         fake_imgs = gen(masks |> device) |> cpu
 
+        real_imgs .+= 0.5f0
+
         masks .+= 1f0
         masks ./= 2f0
 
-        @show extrema(fake_imgs)
         fake_imgs .+= 0.5f0
         clamp!(fake_imgs, 0f0, 1f0)
 
         for i in 1:size(fake_imgs, 4)
             mask_falsecolor = false_color_mapped(masks[:,:,:,i])
-            real_img_falsecolor = false_color_subset(real_imgs[:,:,:,i], r_idx, g_idx, b_idx)
-            fake_img_falsecolor = false_color_subset(fake_imgs[:,:,:,i], r_idx, g_idx, b_idx)
+            real_img_falsecolor = false_color_sum(real_imgs[:,:,:,i])
+            fake_img_falsecolor = false_color_sum(fake_imgs[:,:,:,i])
 
             open(joinpath(path, @sprintf("fake-img-%09d.png", k)), "w") do output
                 img = cat(mask_falsecolor, real_img_falsecolor, fake_img_falsecolor, dims=2)
@@ -916,6 +1018,13 @@ function gen_and_write_examples(
             # end
         end
    end
+end
+
+
+function false_color_sum(img::Array{Float32, 3})
+    img = sum(img, dims=3)[:,:,1]
+    img ./= max(1f0, maximum(img))
+    return (c -> RGB{Float64}(c, c, c)).(img)
 end
 
 
@@ -985,14 +1094,18 @@ parameters to another hdf5 file.
 function train_cgan(
         training_data_filename::String;
         # nepochs::Int=100,
-        nepochs::Int=100,
-        batchsize::Int=5,
+        # nepochs::Int=10,
+        nepochs::Int=40,
+        batchsize::Int=20,
         λ::Float32=100f0)
 
-    # TODO: BatchNorm produces NaNs when batch size is 1.
+    CUDA.allowscalar(false)
 
+    println("Reading training data...")
     trainingdata, channel_names, masks, imgs = read_training_data(
         training_data_filename, batchsize)
+
+    println("Done. ($(size(masks, 4)) training examples.)")
 
     r_idx, g_idx, b_idx = top3_variable_channels(imgs)
     println(
@@ -1006,8 +1119,11 @@ function train_cgan(
 
     # Find the three most variable channels to map to RGB
 
-    gen = Generator(maskdepth, imgdepth)
-    disc = Discriminator(maskdepth, imgdepth)
+    # gen = Generator256(maskdepth, imgdepth)
+    # disc = PatchDiscriminator256(maskdepth, imgdepth)
+
+    gen = Generator64(maskdepth, imgdepth)
+    disc = Discriminator64(maskdepth, imgdepth)
 
     # Make sure I can run these
     # (masks, real_imgs) = first(trainingdata)
