@@ -53,7 +53,7 @@ function fit_expression_model(
 
     σs = zeros(Float32, (ngenes, ncelltypes))
     for (i, label) in enumerate(labels)
-        σs[:,label] = (X[:,i] .- μs[:,label]).^2
+        σs[:,label] .+= (X[:,i] .- μs[:,label]).^2
     end
     σs ./= ns
     σs = sqrt.(σs)
