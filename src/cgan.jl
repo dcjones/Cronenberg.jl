@@ -11,9 +11,11 @@ import TiffImages
 import Zygote
 using ColorVectorSpace
 using Flux
-using Flux.Losses: logitbinarycrossentropy, mae
+using Flux.Losses: logitbinarycrossentropy, mae, mse
 using Flux.Optimise: update!
+using Functors: @functor
 using Statistics
+using Random: randn!
 
 const device = gpu
 # const device = cpu
@@ -608,7 +610,9 @@ function read_training_data(training_data_filename::String, batchsize::Int)
     imgs = read(input["imgs"])
     channel_names = read(input["channel_names"])
 
-    imgs .-= 0.5f0
+    imgs .*= 2f0
+    imgs .-= 1f0
+
     masks .*= 2f0
     masks .-= 1f0
 
@@ -634,13 +638,12 @@ function downsample(filters::Int, indepth::Int, outdepth::Int; batchnorm=true, a
         (filters, filters),
         indepth => outdepth,
         stride=2,
-        # pad=SamePad(),
         pad=1,
-        init=(dims...) -> 0.02f0 .* randn(Float32, dims...),
+        init=(dims...) -> 0.002f0 .* randn(Float32, dims...),
         bias=false))
 
     if batchnorm
-        push!(layers, BatchNorm(outdepth))
+        push!(layers, BatchNorm(outdepth, ϵ=1f-3, momentum=0.99f0))
     end
 
     if activate
@@ -659,11 +662,11 @@ function upsample(filters::Int, indepth::Int, outdepth::Int; dropout=false)
         (filters, filters),
         indepth => outdepth,
         stride=2,
-        pad=SamePad(),
-        init=(dims...) -> 0.02f0 .* randn(Float32, dims...),
+        pad=1,
+        init=(dims...) -> 0.002f0 .* randn(Float32, dims...),
         bias=false))
 
-    push!(layers, BatchNorm(outdepth))
+    push!(layers, BatchNorm(outdepth, ϵ=1f-3, momentum=0.99f0))
 
     if dropout
         push!(layers, Dropout(0.5))
@@ -682,6 +685,7 @@ struct Discriminator64 <: Discriminator
     layers
 end
 
+@functor Discriminator64
 
 function Flux.params(disc::Discriminator64)
     return params(disc.layers)
@@ -707,7 +711,8 @@ end
 
 
 function (disc::Discriminator64)(mask::AbstractArray, img::AbstractArray)
-    return disc.layers(cat(mask, img, dims=3))
+    score = disc.layers(cat(mask, img, dims=3))
+    return score
 end
 
 struct PatchDiscriminator256 <: Discriminator
@@ -715,6 +720,8 @@ struct PatchDiscriminator256 <: Discriminator
     patch_block
     output_layer
 end
+
+@functor PatchDiscriminator256
 
 
 function Flux.params(disc::PatchDiscriminator256)
@@ -777,15 +784,18 @@ struct Generator64 <: Generator
 end
 
 
+@functor Generator64
+
+
 function Flux.params(gen::Generator64)
     return params(gen.downsample_layers, gen.upsample_layers, gen.output_layer)
 end
 
 
-function Generator64(maskdepth::Int, imgdepth::Int)
+function Generator64(maskdepth::Int, noisedepth::Int, imgdepth::Int)
     # Input assumed to be [64, 64, indepth, B]
     downsample_layers = [
-        downsample(4, maskdepth, 256, batchnorm=false), # [32, 32, 256, B]
+        downsample(4, maskdepth+noisedepth, 256, batchnorm=false), # [32, 32, 256, B]
         downsample(4, 256, 512), # [16, 16, 512, B]
         downsample(4, 512, 512), # [8, 8, 512, B]
         downsample(4, 512, 512), # [4, 4, 512, B]
@@ -802,9 +812,18 @@ function Generator64(maskdepth::Int, imgdepth::Int)
         upsample(4, 1024, 256), # [32, 32, 256, B]
     ] .|> device
 
+    # upsample_layers = [
+    #     upsample(4, 512, 512, dropout=true), # [2, 2, 512, B]
+    #     upsample(4, 512, 512, dropout=true), # [4, 4, 512, B]
+    #     upsample(4, 512, 512, dropout=true), # [8, 8, 512, B]
+    #     upsample(4, 512, 512), # [16, 16, 512, B]
+    #     upsample(4, 512, 256), # [32, 32, 256, B]
+    # ] .|> device
+
     output_lyr = ConvTranspose(
         (4, 4),
         512 => imgdepth,
+        # 256 => imgdepth,
         tanh,
         stride=2,
         pad=SamePad(),
@@ -815,8 +834,11 @@ function Generator64(maskdepth::Int, imgdepth::Int)
 end
 
 
-function (gen::Generator64)(masks::AbstractArray)
-    down32 = gen.downsample_layers[1](masks)
+function (gen::Generator64)(masks::AbstractArray, noise::AbstractArray)
+    # TODO: let's just feed it shit and see what happens
+    # masks = randn!(similar(masks)) |> device
+
+    down32 = gen.downsample_layers[1](cat(masks, noise, dims=3))
     down16  = gen.downsample_layers[2](down32)
     down8  = gen.downsample_layers[3](down16)
     down4  = gen.downsample_layers[4](down8)
@@ -831,6 +853,16 @@ function (gen::Generator64)(masks::AbstractArray)
 
     out =  gen.output_layer(cat(up32, down32, dims=3))
 
+    # up2   = gen.upsample_layers[1](down1)
+    # up4   = gen.upsample_layers[2](up2)
+    # up8   = gen.upsample_layers[3](up4)
+    # up16  = gen.upsample_layers[4](up8)
+
+    # # up16 = randn!(similar(up16)) |> device
+    # up32  = gen.upsample_layers[5](up16)
+
+    # out =  gen.output_layer(up32)
+
     return out
 end
 
@@ -840,6 +872,8 @@ struct Generator256 <: Generator
     upsample_layers
     output_layer::ConvTranspose
 end
+
+@functor Generator256
 
 
 function Flux.params(gen::Generator256)
@@ -913,6 +947,7 @@ function generator_loss(
         fake_disc::AbstractArray, λ::Float32)
     gan_loss = logitbinarycrossentropy(fake_disc, 1f0)
     l1_loss = mae(real_imgs, fake_imgs)
+    # l1_loss = mse(real_imgs, fake_imgs)
 
     return gan_loss + (λ * l1_loss)
 end
@@ -941,13 +976,18 @@ Take one gradient descent step on one batch of training data.
 function train_step(
         gen_opt, disc_opt,
         gen::Generator, disc::Discriminator,
-        masks::AbstractArray, real_imgs::AbstractArray;
+        masks::AbstractArray, real_imgs::AbstractArray,
+        noisedepth::Int;
         λ::Float32=100f0)
+
+    # TODO: generate noise (what dimensions?)
+    noise = randn(
+        Float32, (size(masks, 1), size(masks, 2), noisedepth, size(masks, 4))) |> device
 
     ps = params(gen)
     loss = Dict()
     loss["gen"], back = Zygote.pullback(ps) do
-        fake_imgs = gen(masks)
+        fake_imgs = gen(masks, noise)
         loss["disc"] = train_discriminator(disc_opt, disc, masks, real_imgs, fake_imgs)
         return generator_loss(real_imgs, fake_imgs, disc(masks, fake_imgs), λ)
     end
@@ -962,25 +1002,30 @@ For debugging. Generate images using a trained generator and write them to a png
 """
 function gen_and_write_examples(
         gen::Generator, path::String, trainingdata,
-        r_idx::Int, g_idx::Int, b_idx::Int)
+        noisedepth::Int, r_idx::Int, g_idx::Int, b_idx::Int)
     k = 0
     mkpath(path)
 
     for (masks, real_imgs) in trainingdata
-        fake_imgs = gen(masks |> device) |> cpu
+        noise = randn(Float32, (size(masks, 1), size(masks, 2), noisedepth, size(masks, 4)))
+        fake_imgs = gen(masks |> device, noise |> device) |> cpu
 
-        real_imgs .+= 0.5f0
+        real_imgs .+= 1f0
+        real_imgs ./= 2f0
+
+        fake_imgs .+= 1f0
+        fake_imgs ./= 2f0
 
         masks .+= 1f0
         masks ./= 2f0
 
-        fake_imgs .+= 0.5f0
-        clamp!(fake_imgs, 0f0, 1f0)
-
         for i in 1:size(fake_imgs, 4)
             mask_falsecolor = false_color_mapped(masks[:,:,:,i])
-            real_img_falsecolor = false_color_sum(real_imgs[:,:,:,i])
-            fake_img_falsecolor = false_color_sum(fake_imgs[:,:,:,i])
+            # real_img_falsecolor = false_color_sum(real_imgs[:,:,:,i])
+            # fake_img_falsecolor = false_color_sum(fake_imgs[:,:,:,i])
+
+            real_img_falsecolor = false_color_subset(real_imgs[:,:,:,i], r_idx, g_idx, b_idx)
+            fake_img_falsecolor = false_color_subset(fake_imgs[:,:,:,i], r_idx, g_idx, b_idx)
 
             open(joinpath(path, @sprintf("fake-img-%09d.png", k)), "w") do output
                 img = cat(mask_falsecolor, real_img_falsecolor, fake_img_falsecolor, dims=2)
@@ -1093,11 +1138,10 @@ parameters to another hdf5 file.
 """
 function train_cgan(
         training_data_filename::String;
-        # nepochs::Int=100,
-        # nepochs::Int=10,
         nepochs::Int=40,
         batchsize::Int=20,
-        λ::Float32=100f0)
+        noisedepth::Int=4,
+        λ::Float32=200f0)
 
     CUDA.allowscalar(false)
 
@@ -1114,6 +1158,11 @@ function train_cgan(
         channel_names[g_idx], ", ",
         channel_names[b_idx])
 
+
+    r_idx = findfirst(isequal("Glucose Transporter"), channel_names)
+    g_idx = findfirst(isequal("HOECHST1"), channel_names)
+    b_idx = findfirst(isequal("MMP12"), channel_names)
+
     maskdepth = size(masks, 3)
     imgdepth = size(imgs, 3)
 
@@ -1122,7 +1171,7 @@ function train_cgan(
     # gen = Generator256(maskdepth, imgdepth)
     # disc = PatchDiscriminator256(maskdepth, imgdepth)
 
-    gen = Generator64(maskdepth, imgdepth)
+    gen = Generator64(maskdepth, noisedepth, imgdepth)
     disc = Discriminator64(maskdepth, imgdepth)
 
     # Make sure I can run these
@@ -1137,20 +1186,23 @@ function train_cgan(
 
     for epoch in 1:nepochs
         println("Epoch: ", epoch)
-        total_loss = 0.0
+        total_gen_loss = 0.0
+        total_disc_loss = 0.0
         for (masks, real_imgs) in trainingdata
             loss = train_step(
                 gen_opt, disc_opt, gen, disc,
                 masks |> device, real_imgs |> device,
-                λ=λ)
+                noisedepth, λ=λ)
 
-            total_loss += loss["gen"] + loss["disc"]
+            total_gen_loss += loss["gen"]
+            total_disc_loss += loss["disc"]
         end
-        @show total_loss
+        @show (total_gen_loss, total_disc_loss)
     end
 
+    testmode!(gen, false)
     gen_and_write_examples(
-        gen, "fake-imgs", trainingdata, r_idx, g_idx, b_idx)
+        gen, "fake-imgs", trainingdata, noisedepth, r_idx, g_idx, b_idx)
 
     # TODO: remember we have to use `testmode!` to disable dropout once
     # we actually use the model.
