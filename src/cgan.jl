@@ -695,16 +695,10 @@ end
 function Discriminator64(maskdepth::Int, imgdepth::Int)
     layers = Chain(
         downsample(4, maskdepth+imgdepth, 64, batchnorm=false), # [32, 32, 64, B]
-        downsample(4, 64, 128), # [16, 16, 128, B]
-        downsample(4, 128, 256), # [16, 16, 128, B]
+        Conv((4,4), 64 => 32), # [29, 29, 32, B],
+        x -> leakyrelu.(x),
         Flux.flatten,
-        Dense(8*8*256, 1)) |> device
-
-    # TODO: Just testing
-    # layers = Chain(
-    #     downsample(4, maskdepth+imgdepth, 64, batchnorm=false), # [32, 32, 64, B]
-    #     Flux.flatten,
-    #     Dense(32*32*64, 1)) |> device
+        Dense(29*29*32, 1)) |> device
 
     return Discriminator64(layers)
 end
@@ -1141,7 +1135,7 @@ function train_cgan(
         nepochs::Int=40,
         batchsize::Int=20,
         noisedepth::Int=4,
-        λ::Float32=200f0)
+        λ::Float32=100f0)
 
     CUDA.allowscalar(false)
 
