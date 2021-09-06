@@ -1,10 +1,4 @@
 
-
-
-# Ok, let's write an actual basic bitch CVAE in julia, not the weird graph shit
-# I did in python.
-
-
 import Zygote
 using Flux
 using Flux: @functor, onehotbatch
@@ -75,7 +69,7 @@ function train_step(enc, dec, opt, x, labels)
         x̄ = dec(z, labels)
 
         logp = -sum((x .- x̄).^2)
-        kl = sum(σ.^2 + μ.^2 .- 1f0 .- 2f0 .* logσ)
+        kl = 0.5f0 * sum(σ.^2 + μ.^2 .- 1f0 .- 2f0 .* logσ)
         elbo = logp - kl
 
         return -elbo
@@ -90,7 +84,7 @@ function fit_expression_model_cvae(
         input_h5ad_filename::String,
         output_params_filename::String;
         seed::Int=0, nepochs::Int=10000,
-        hidden_dim::Int=40, z_dim::Int=10)
+        hidden_dim::Int=80, z_dim::Int=10)
 
     adata = read(input_h5ad_filename, AnnData)
 
@@ -101,7 +95,7 @@ function fit_expression_model_cvae(
 
     enc = Encoder(ngenes, ncelltypes, hidden_dim, z_dim) |> device
     dec = Decoder(z_dim, ncelltypes, hidden_dim, ngenes) |> device
-    opt = ADAM(1e-3, (0.5, 0.999))
+    opt = ADAM(1e-3, (0.9,  0.999))
 
     for epoch in 1:nepochs
         neg_elbo = train_step(enc, dec, opt, x, labels)

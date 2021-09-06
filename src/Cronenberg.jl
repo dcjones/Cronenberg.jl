@@ -27,9 +27,8 @@ using Statistics
 #     copy!(anndata_py, pyimport("anndata"))
 # end
 
-# include("cvae.jl")
-
-include("cgan.jl")
+include("cvae.jl")
+include("inverse-segmentation.jl")
 
 
 function fit_expression_model(
@@ -65,6 +64,40 @@ function fit_expression_model(
 end
 
 
+function fit_expression_model_fullcov(
+        input_h5ad_filename::String,
+        output_params_filename::String)
+
+    adata = read(input_h5ad_filename, AnnData)
+    labels = adata.obs.label .+ 1
+    X = adata.X
+    ncelltypes = maximum(labels)
+    ngenes, ncells = size(X)
+
+    μs = zeros(Float32, (ngenes, ncelltypes))
+    ns = zeros(Int, (1, ncelltypes))
+
+    for (i, label) in enumerate(labels)
+        μs[:,label] .+= X[:,i]
+        ns[1, label] += 1
+    end
+    μs ./= ns
+
+    Σs = zeros(Float32, (ngenes, ngenes, ncelltypes))
+    for (i, label) in enumerate(labels)
+        d = X[:,i] - μs[:,label]
+        Σs[:,:,label] .+=  d*d'
+    end
+    ns = reshape(ns, (1, 1, ncelltypes))
+    Σs ./= ns
+
+    h5open(output_params_filename, "w") do output
+        output["μ"] = μs
+        output["Σ"] = Σs
+    end
+end
+
+
 function sample_expression_model(
         input_params_filename::String,
         input_h5ad_filename::String,
@@ -84,6 +117,42 @@ function sample_expression_model(
     X = Array{Float32}(undef, (ngenes, ncells))
     for (i, label) in enumerate(labels)
         X[:,i] = rand(MvNormal(μs[:,label], σs[:,label]))
+    end
+
+    var = DataFrame(
+        "_index" => String[string(i-1) for i in 1:ngenes])
+
+    adata = AnnData(
+        X,
+        adata.obsm,
+        adata.obsp,
+        adata.uns,
+        adata.obs,
+        var)
+
+    write(output_h5ad_filename, adata)
+end
+
+
+function sample_expression_model_fullcov(
+        input_params_filename::String,
+        input_h5ad_filename::String,
+        output_h5ad_filename::String)
+    params = h5open(input_params_filename)
+    μs = read(params["μ"])
+    Σs = read(params["Σ"])
+    close(params)
+
+    @assert size(μs, 1) == size(Σs, 1) && size(μs, 1) == size(Σs, 2) && size(μs, 2) == size(Σs, 3)
+    ngenes, ncelltypes = size(μs)
+
+    adata = read(input_h5ad_filename, AnnData)
+    labels = adata.obs.label .+ 1
+    ncells = size(adata.X, 2)
+
+    X = Array{Float32}(undef, (ngenes, ncells))
+    for (i, label) in enumerate(labels)
+        X[:,i] = rand(MvNormal(μs[:,label], Σs[:,:,label]))
     end
 
     var = DataFrame(
@@ -1337,7 +1406,7 @@ end
 Sample from the cell model and write to a new h5ad file.
 """
 function sample_cell_model(
-        input_params_filename::String, output_h5ad_filename::String,
+        input_params_filename::String, output_h5ad_filename::String;
         nsteps=5000, T::Float64=1.0, m=1000, n=1000, ncells=10000)
 
     # TODO: should the initialization also be fit the training dataset somehow?

@@ -14,12 +14,15 @@ using Flux
 using Flux.Losses: logitbinarycrossentropy, mae, mse
 using Flux.Optimise: update!
 using Functors: @functor
-using Statistics
+using PolygonOps: centroid
 using Random: randn!
+using Statistics
 
 const device = gpu
 # const device = cpu
 
+# To make centroid() work
+Base.zero(::Type{Tuple{Float32,Float32}}) = (0f0, 0f0)
 
 """
 Match up cells json files to their accompanying tiff files. Not every tiff file
@@ -306,6 +309,10 @@ function make_cgan_cell_training_examples(
 
     count = 0
     skip_count = 0
+
+    xs = Float32[]
+    ys = Float32[]
+
     for (cells_filename, imgs_filename) in cells_imgs_filenames
         if count > max_images
             break
@@ -319,6 +326,7 @@ function make_cgan_cell_training_examples(
         tile_x = parse(Int, imgs_mat.captures[2])
         tile_y = parse(Int, imgs_mat.captures[3])
         tile = (r=tile_r, x=tile_x, y=tile_y)
+
 
         println("Reading ", imgs_filename)
         tiffimg = TiffImages.load(imgs_filename)
@@ -336,6 +344,9 @@ function make_cgan_cell_training_examples(
 
         height, width, nchannels = size(img)
 
+        tile_xoff = (tile_x-1) * width
+        tile_yoff = (tile_y-1) * height
+
         celldata = open(cells_filename) do input
             JSON.parse(input)
         end
@@ -352,6 +363,16 @@ function make_cgan_cell_training_examples(
             label = labels[cell_id]
 
             poly = [(Float32(x), Float32(y)) for (x, y) in cell["poly"]]
+
+            cell_x, cell_y = centroid(poly)
+            cell_x += tile_xoff
+            cell_y += tile_yoff
+
+            push!(xs, cell_x)
+            push!(ys, cell_y)
+
+            # TODO: compute polygon median and offset by tile coords
+            # to get cell (x, y) coords.
 
             xmin, xmax = extrema([x for (x, y) in poly])
             ymin, ymax = extrema([y for (x, y) in poly])
@@ -393,7 +414,8 @@ function make_cgan_cell_training_examples(
     end
 
     if h5_output_filename !== nothing
-        write_training_examples_hdf5(h5_output_filename, training_examples, channel_names)
+        write_training_examples_hdf5(
+            h5_output_filename, training_examples, channel_names, xs, ys)
     end
 
     return training_examples
@@ -422,7 +444,9 @@ Dump training examples to one big hdf5 file.
 function write_training_examples_hdf5(
         filename::String,
         training_exampes::Vector{Tuple{Array{Float32, 3}, Array{Float32, 3}}},
-        channel_names::Vector{String})
+        channel_names::Vector{String},
+        xs=Union{Vector{Float32}, Nothing},
+        ys=Union{Vector{Float32}, Nothing})
 
     n = length(training_exampes)
     output = h5open(filename, "w")
@@ -433,6 +457,14 @@ function write_training_examples_hdf5(
     output["imgs"] = imgs
     output["masks"] = masks
     output["channel_names"] = channel_names
+
+    if xs !== nothing
+        output["x"] = xs
+    end
+
+    if ys !== nothing
+        output["y"] = ys
+    end
 
     close(output)
 end
