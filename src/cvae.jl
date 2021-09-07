@@ -104,6 +104,22 @@ function fit_expression_model_cvae(
         end
     end
 
+    # TODO: do debug this I want to pass some data through the decoder
+    # and plot the latent space
+
+    μ, logσ = enc(x, labels)
+    σ = exp.(logσ) .+ 1f-6
+    z = device(randn(Float32, size(μ))) .* σ
+    x̄ = dec(z, labels)
+
+    open("debugging-cvae.csv", "w") do output
+        labels_oc = Flux.onecold(labels)
+        println(output, "label,z1,z2,μ1,logσ1")
+        for i in 1:ncells
+            println(output, labels_oc[i], ",", z[1,i], ",", z[2,i], ",", μ[1,i], ",", logσ[1,i])
+        end
+    end
+
     dec_cpu = cpu(dec)
     BSON.@save output_params_filename z_dim dec_cpu
 end

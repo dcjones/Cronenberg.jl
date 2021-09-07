@@ -29,6 +29,7 @@ using Statistics
 
 include("cvae.jl")
 include("inverse-segmentation.jl")
+include("expression-simulation.jl")
 
 
 function fit_expression_model(
