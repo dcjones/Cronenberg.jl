@@ -34,3 +34,6 @@ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 TiffImages = "731e570b-9d59-4bfa-96dc-6df516fadf69"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
+
+[compat]
+CUDA = "≥ 3.4.2"

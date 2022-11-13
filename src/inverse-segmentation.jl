@@ -301,7 +301,8 @@ function make_cgan_cell_training_examples(
 
     pat = r"R(\d+)_X(\d+)_Y(\d+)"
 
-    training_examples = Tuple{Array{Float32, 3}, Array{Float32, 3}}[]
+    # training_examples = Tuple{Array{Float32, 3}, Array{Float32, 3}}[]
+    training_examples = Array{Float32, 3}[]
 
     cells_imgs_filenames = match_cells_imgs_filenames(cells_filenames, imgs_filenames)
 
@@ -312,6 +313,14 @@ function make_cgan_cell_training_examples(
 
     xs = Float32[]
     ys = Float32[]
+
+    function parse_tile_xy(filename)
+        imgs_mat = match(pat, filename[2])
+        tile_x = parse(Int, imgs_mat.captures[2])
+        tile_y = parse(Int, imgs_mat.captures[3])
+        return (tile_x, tile_y)
+    end
+    sort!(cells_imgs_filenames, by=parse_tile_xy)
 
     for (cells_filename, imgs_filename) in cells_imgs_filenames
         if count > max_images
@@ -368,15 +377,13 @@ function make_cgan_cell_training_examples(
             cell_x += tile_xoff
             cell_y += tile_yoff
 
-            push!(xs, cell_x)
-            push!(ys, cell_y)
-
             # TODO: compute polygon median and offset by tile coords
             # to get cell (x, y) coords.
 
             xmin, xmax = extrema([x for (x, y) in poly])
             ymin, ymax = extrema([y for (x, y) in poly])
 
+            # TODO: Instead of skipping, should I just clip?
             if xmax - xmin + 4 > ex_width || ymax - ymin + 4 > ex_height
                 skip_count += 1
                 continue
@@ -388,6 +395,9 @@ function make_cgan_cell_training_examples(
             # xoff = round(Int, xmin - 1)
             # yoff = round(Int, ymin - 1)
 
+            push!(xs, cell_x)
+            push!(ys, cell_y)
+
             xoff = round(Int, xmin - 1) - round(Int, (ex_width - (xmax - xmin))/2)
             yoff = round(Int, ymin - 1) - round(Int, (ex_height - (ymax - ymin))/2)
 
@@ -396,13 +406,17 @@ function make_cgan_cell_training_examples(
             cell_mask = zeros(Float32, (ex_height, ex_width, ncelltypes))
             draw_polygon!(cell_mask, offset_poly, label)
 
-            cell_img = zeros(Float32, (ex_height, ex_width, nchannels))
-            copy_polygon!(cell_img, img, poly, xoff, yoff)
+            # cell_img = zeros(Float32, (ex_height, ex_width, nchannels))
+            # copy_polygon!(cell_img, img, poly, xoff, yoff)
 
-            push!(training_examples, (cell_img, cell_mask))
+            # TODO: 
+
+            # push!(training_examples, (cell_img, cell_mask))
+            push!(training_examples, cell_mask)
         end
     end
 
+    println("Read $(length(training_examples)) training examples")
     println("Skipped $(skip_count) cells that were too big.")
 
     if isempty(training_examples)
@@ -430,8 +444,14 @@ function cat_images(imgs::Vector{Array{Float32, 3}})
     n = length(imgs)
     catimg = Array{Float32}(undef, (h, w, d, n))
 
+    # TODO: Ok, this mysteriously segfaults if I use all the data. I don't
+    # know what else to do. I guess its using too much memory.
+
     for (l, img) in enumerate(imgs)
+        @assert size(img) == (h, w, d)
         catimg[:,:,:,l] .= img
+        # ccall(:memcpy, Cvoid, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t),
+        #     Ref(catimg, 1+h*w*d*(l-1)), pointer(img), h*w*d*sizeof(Float32))
     end
 
     return catimg
@@ -443,18 +463,20 @@ Dump training examples to one big hdf5 file.
 """
 function write_training_examples_hdf5(
         filename::String,
-        training_exampes::Vector{Tuple{Array{Float32, 3}, Array{Float32, 3}}},
+        # training_examples::Vector{Tuple{Array{Float32, 3}, Array{Float32, 3}}},
+        training_examples,
         channel_names::Vector{String},
         xs=Union{Vector{Float32}, Nothing},
         ys=Union{Vector{Float32}, Nothing})
 
-    n = length(training_exampes)
+    n = length(training_examples)
     output = h5open(filename, "w")
 
-    imgs = cat_images([img for (img, mask) in training_exampes])
-    masks = cat_images([mask for (img, mask) in training_exampes])
+    # imgs = cat_images([img for (img, mask) in training_examples])
+    # masks = cat_images([mask for (img, mask) in training_examples])
+    masks = cat_images(training_examples)
 
-    output["imgs"] = imgs
+    # output["imgs"] = imgs
     output["masks"] = masks
     output["channel_names"] = channel_names
 
