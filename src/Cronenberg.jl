@@ -18,20 +18,6 @@ using StaticArrays
 using Statistics
 
 
-# const cvae_py = PyNULL()
-# const anndata_py = PyNULL()
-# function __init__()
-#     python_path = PyVector(getproperty(pyimport("sys"), "path"))
-#     pushfirst!(python_path, joinpath(dirname(pathof(Cronenberg))))
-#     copy!(cvae_py, pyimport("cvae"))
-#     copy!(anndata_py, pyimport("anndata"))
-# end
-
-include("cvae.jl")
-include("inverse-segmentation.jl")
-include("expression-simulation.jl")
-
-
 function fit_expression_model(
         input_h5ad_filename::String,
         output_params_filename::String)
