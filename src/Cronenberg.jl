@@ -5,7 +5,7 @@ import ColorSchemes
 using ArgParse
 using Colors: hex, LCHab, RGB
 using DataFrames
-using Distributions: Categorical, MvNormal
+using Distributions: Categorical, MvNormal, mode
 using FileIO
 using HDF5
 using Images
@@ -471,9 +471,9 @@ function World(rules::RuleSet, m::Int, n::Int, ncells::Int; nominal_tile_size::I
     volumes = zeros(Int32, ncells)
     areas = zeros(Int32, ncells)
 
-    # # Uniform random initialization
-    # coords = [(i,j) for i in 1:m, j in 1:n]
-    # shuffle!(coords)
+    # Uniform random initialization
+    coords = [(i,j) for i in 1:m, j in 1:n]
+    shuffle!(coords)
 
     # for k in 1:ncells
     #     i, j = coords[k]
@@ -483,17 +483,39 @@ function World(rules::RuleSet, m::Int, n::Int, ncells::Int; nominal_tile_size::I
     #     areas[k] = 1
     # end
 
-    # Produce random layers of cells
+
+    # # Produce random layers of cells
+    # coords = [(i,j) for i in 1:m, j in 1:n]
+    # shuffle!(coords)
+
+    # freqs = [(0.2 * m + rand() * 0.5 * m) for _ in 1:rules.ncelltypes] ./ (2*π)
+    # offsets = [π*rand() for _ in 1:rules.ncelltypes]
+
+    # for k in 1:ncells
+    #     i, j = coords[k]
+    #     state[i, j] = k
+    #     type = rand(Categorical(softmax(sin.(offsets .+ i ./ freqs))))
+    #     types[k] = type
+    #     volumes[k] = 1
+    #     areas[k] = 1
+    # end
+
+
+    # Vary in bands in x and y
     coords = [(i,j) for i in 1:m, j in 1:n]
     shuffle!(coords)
 
-    freqs = [(0.2 * m + rand() * 0.5 * m) for _ in 1:rules.ncelltypes] ./ (2*π)
-    offsets = [π*rand() for _ in 1:rules.ncelltypes]
+    x_freqs = [(0.2 * m + rand() * 0.5 * m) for _ in 1:rules.ncelltypes] ./ (2*π)
+    x_offsets = [π*rand() for _ in 1:rules.ncelltypes]
+
+    y_freqs = [(0.2 * m + rand() * 0.5 * m) for _ in 1:rules.ncelltypes] ./ (2*π)
+    y_offsets = [π*rand() for _ in 1:rules.ncelltypes]
 
     for k in 1:ncells
         i, j = coords[k]
         state[i, j] = k
-        type = rand(Categorical(softmax(sin.(offsets .+ i ./ freqs))))
+        # type = rand(Categorical(softmax(sin.(y_offsets .+ i ./ y_freqs) .+ sin.(x_offsets .+ j ./ x_freqs))))
+        type = mode(Categorical(softmax(sin.(y_offsets .+ i ./ y_freqs) .+ sin.(x_offsets .+ j ./ x_freqs))))
         types[k] = type
         volumes[k] = 1
         areas[k] = 1
@@ -1408,7 +1430,8 @@ Sample from the cell model and write to a new h5ad file.
 """
 function sample_cell_model(
         input_params_filename::String, output_h5ad_filename::String;
-        nsteps=5000, T::Float64=1.0, m=1000, n=1000, ncells=10000)
+        nsteps=5000, T::Float64=1.0, m=1000, n=1000, ncells=10000,
+        image_filename=nothing)
 
     # TODO: should the initialization also be fit the training dataset somehow?
 
@@ -1440,6 +1463,20 @@ function sample_cell_model(
         next!(prog)
     end
     finish!(prog)
+
+    if image_filename !== nothing
+        color_scheme = ColorSchemes.colorschemes[
+            :diverging_rainbow_bgymr_45_85_c67_n256]
+        colors = [ColorSchemes.get(color_scheme, i, (1,ruleset.ncelltypes)) for i in 1:ruleset.ncelltypes]
+        pixelsize = 2
+        img = Matrix{RGB24}(undef, (m*pixelsize, n*pixelsize))
+        draw_world!(img, world, colors, ruleset.ncelltypes)
+        open(image_filename, "w") do output
+            # TODO: png output is currently broken: https://github.com/JuliaIO/ImageMagick.jl/issues/206
+            # save(Stream{format"PNG"}(output), img)
+            save(Stream{format"JPEG"}(output), img)
+        end
+    end
 
     write_positions(output_h5ad_filename, world)
 end
